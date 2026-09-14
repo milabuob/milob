@@ -294,8 +294,8 @@ def calculate_optical_properties_moments(datastream_mom, n=1.37):
     return optical_xr, metadata
 
 
-# --- FITTING METHOD ---
 # - Utilities -
+# REMOVE? - NEW FITTING FUNCTIONS IN processing.fitting
 def tdde_model(t, mua, mus, A, rho):
     """
     Evaluate the time-domain diffusion model for a semi-infinite medium.
@@ -596,9 +596,6 @@ def opt_params_to_conc(mua, water_corr, water_frac, attrs=None,
         raise ValueError(f"Concentration derivation requires at least 2 wavelengths."
                          f"Found only {len(wls)}: {wls}")
 
-    # include_water=water_corr -- only request the water column (sparser than
-    # the Hb columns, see get_extinction_coefficients_Prahl's docstring) when
-    # it's actually going to be used, not unconditionally.
     constants = get_extinction_coefficients_Prahl(wavelengths=wls, include_water=water_corr)
 
     mua_measured = mua  # shape (time, channel, wavelength)
@@ -606,7 +603,6 @@ def opt_params_to_conc(mua, water_corr, water_frac, attrs=None,
     if water_corr:
         # Subtract the water contribution from measured mu_a
         # mua_corr = mua_tot - (mu_water * water_frac), e.g. water_frac=0.75
-        # assumes tissue is 75% water
         mua_water = xr.DataArray(constants['water_mua'], coords={'wavelength': wls})
         mua = mua_measured - (mua_water * water_frac)
     else:
@@ -624,8 +620,6 @@ def opt_params_to_conc(mua, water_corr, water_frac, attrs=None,
     hbr = (mua * xr.DataArray(E_inv[1, :], coords={'wavelength': wls})).sum(dim='wavelength') *1e6
 
     # Rebuild DataArray
-    # Dimensions are taken from `mua` rather than hardcoded, so any spatial
-    # index (channel, voxel, ...) survives the unmixing untouched.
     keep_dims = [d for d in mua.dims if d not in ('wavelength', 'op', 'layer')]
     conc_data = np.stack([hbo.transpose(*keep_dims).values,
                           hbr.transpose(*keep_dims).values], axis=-1)
@@ -646,10 +640,7 @@ def opt_params_to_conc(mua, water_corr, water_frac, attrs=None,
     if uncertainty is None:
         return out
 
-    # Linear propagation: c = E^+ mua, so var(c) = (E^+)^2 var(mua) with
-    # wavelengths independent -- an available rule, so it is applied rather
-    # than discarded (milob-package-design invariant 7). 1e12 = (1e6)^2,
-    # matching the M -> uM scaling applied to the concentrations above.
+    # Linear propagation: c = E^+ mua, so var(c) = (E^+)^2 var(mua) with wavelengths independent
     var_hbo = (uncertainty * xr.DataArray(E_inv[0, :] ** 2, coords={'wavelength': wls})
                ).sum(dim='wavelength') * 1e12
     var_hbr = (uncertainty * xr.DataArray(E_inv[1, :] ** 2, coords={'wavelength': wls})
@@ -662,8 +653,6 @@ def opt_params_to_conc(mua, water_corr, water_frac, attrs=None,
                               '(uM^2), propagated through the linear unmixing'},
     )
     return out, var_out
-
-
 
 
 # ADD DPF FUNCTION - MS
