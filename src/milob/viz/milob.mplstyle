@@ -1,0 +1,48 @@
+# MILOB publication style.
+# Applied once via milob.viz.theme.apply_style() -- do not sns.set_style()
+# or mutate plt.rcParams elsewhere in the package.
+
+figure.facecolor: white
+figure.edgecolor: white
+figure.dpi: 100
+savefig.dpi: 300
+savefig.facecolor: white
+savefig.bbox: tight
+
+axes.facecolor: white
+axes.edgecolor: 0.15
+axes.linewidth: 0.8
+axes.spines.top: False
+axes.spines.right: False
+axes.grid: False
+axes.axisbelow: True
+axes.titlesize: 13
+axes.titleweight: bold
+axes.labelsize: 11
+axes.labelweight: normal
+
+xtick.direction: out
+ytick.direction: out
+xtick.labelsize: 9.5
+ytick.labelsize: 9.5
+xtick.color: 0.15
+ytick.color: 0.15
+
+grid.color: 0.85
+grid.linestyle: --
+grid.linewidth: 0.5
+grid.alpha: 0.6
+
+legend.fontsize: 9
+legend.frameon: True
+legend.framealpha: 0.85
+legend.edgecolor: 0.8
+
+lines.linewidth: 1.6
+lines.markeredgewidth: 0.6
+
+font.family: sans-serif
+font.sans-serif: Arial, Helvetica, DejaVu Sans
+font.size: 10.5
+
+image.cmap: viridis

@@ -1,0 +1,63 @@
+# milob/pyproject.toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "milob"
+version = "1.0.0"
+description = "A Python library for diffuse optical analysis"
+authors = [
+    {name = "Rickson C. Mesquita", email = "r.c.mesquita@bham.ac.uk"},
+    {name = "Sergio Novi", email = "SNovi@som.umaryland.edu"},
+    {name = "Ben Fry", email = "baf965@student.bham.ac.uk"},
+    {name = "Maisie Sanderson", email = "mhs549@student.bham.ac.uk"},
+    {name = "Luis F. Bortoletto", email = "l202242@dac.unicamp.br"},
+]
+readme = "README.md"
+requires-python = ">=3.10.4"
+dependencies = [
+    "numpy>=1.20",
+    "xarray>=2023.1.0",
+    "scipy>=1.9.0",
+    "h5py>=3.7.0",
+    "statsmodels>=0.14.0",
+    "scikit-learn>=1.4.0",
+    "joblib>=1.2",
+    "matplotlib>=3.7",
+    "ipywidgets>=8.1",
+    "networkx>=3.6.1",
+    "pandas>=1.5",
+    "PyWavelets>=1.4",
+    "mpmath>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "mypy>=1.0",
+]
+threed = [
+    "pyvista>=0.43",
+]
+image = [
+    "nibabel>=5.0",
+]
+brain = [
+    "nilearn>=0.10",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+]
+
+[tool.setuptools.package-dir]
+"milob" = "src/milob"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"milob.viz" = ["*.mplstyle"]
+"milob.imaging" = ["data/*.obj", "data/*.mat"]
