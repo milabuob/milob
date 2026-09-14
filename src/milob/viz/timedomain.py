@@ -75,7 +75,7 @@ def _get_meta(datastream, key):
     return None
 
 
-def plot_tpsf(datastream, channel="S1D1", wl=690, time_pt=100, normalise=False,
+def plot_tpsf(datastream, channel="S1D1", wl=None, time_pt=0, normalise=False,
                y_max=None, ax=None):
     """
     Plot the temporal point spread function for one channel and wavelength.
