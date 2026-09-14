@@ -133,7 +133,6 @@ class TD_Stream(NirsStream):
             history=history
         )
     
-
     def correct_moments_for_irf(self, irf_stream, inplace: bool = False) -> 'TD_Stream':
         """
         Correct measured moments for the instrument response function.
@@ -168,6 +167,48 @@ class TD_Stream(NirsStream):
             status='moment',
             history=meta['history']
         )
+
+
+    # ------------------------------------------------------------------
+    # DPF Calculation
+    # ------------------------------------------------------------------
+
+    def calculate_dpf(self, n: float = 1.44, mode: str = 'static'):
+        """
+        Estimate the differential pathlength factor (DPF) from TD moments.
+        This accepts either raw TD data or moment data.
+
+        Parameters
+        ----------
+        n : float, optional
+            Refractive index of the medium. Default 1.44.
+        mode : {'static', 'timeseries'}, optional
+            'static' returns a channel-by-wavelength DPF, collapsing time if
+            present. 'timeseries' retains the time dimension when available.
+
+        Returns
+        -------
+        xarray.DataArray
+            DPF values, with dimensions ('channel', 'wavelength') for static
+            mode, or ('time', 'channel', 'wavelength') for timeseries mode.
+
+        Notes
+        -----
+        The underlying relationship is
+            DPF = (c / n) * m1 / rho
+        """
+        if self.status == 'raw':
+            moments = self.to_moments()
+        elif self.status == 'moment':
+            moments = self
+        else:
+            raise ValueError(
+                f"calculate_dpf() requires TD data with status='raw' or 'moment'; "
+                f"got status='{self.status}'."
+            )
+
+        return time_domain.calculate_dpf_moments(moments, n=n, mode=mode)
+    
 
     # ------------------------------------------------------------------
     # Optical property inversion

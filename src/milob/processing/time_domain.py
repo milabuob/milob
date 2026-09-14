@@ -655,4 +655,91 @@ def opt_params_to_conc(mua, water_corr, water_frac, attrs=None,
     return out, var_out
 
 
-# ADD DPF FUNCTION - MS
+def calculate_dpf_moments(td_stream, n=1.44, mode='static'):
+    """
+    Estimate the differential pathlength factor (DPF) from TD moments. The DPF is calculated
+    from the first temporal moment (mean time-of-flight, m1), using the semi-infinite
+    homogenous approximation:
+    DPF = (c / n) * m1 / rho
+
+    Parameters
+    ----------
+    td_stream : TD_Stream
+        Time-domain datastream, in either status='raw' or status='moment'.
+        Raw gated data is converted to moments automatically.
+    n : float, optional
+        Refractive index of the medium. Default is 1.44.
+    mode : {'static', 'timeseries'}, optional
+        If 'static' (default), average over the time axis when present and
+        return DPF with dims ('channel', 'wavelength').
+        If 'timeseries', keep the time dimension and return data with dims
+        ('time', 'channel', 'wavelength') when available.
+    
+    Returns
+    ----------
+    dpf : xarray.DataArray
+        Differential pathlength factor values. For static mode, dims are
+        ('channel', 'wavelength'). For timeseries mode, dims are
+        ('time', 'channel', 'wavelength') when a time axis is present.
+    """
+    if mode not in {'static', 'timeseries'}:
+        raise ValueError(f"Mode must be 'static' or 'timeseries'. Got {mode!r}.")
+
+    # Accept raw TD gated data, and comvert to moments
+    if td_stream.status == 'raw':
+        moments = td_stream.to_moments()
+    elif td_stream.status == 'moment':
+        moments = td_stream
+    else:
+        raise ValueError(
+            f"calculate_dpf() requires TD data with status='raw' or 'moment'. Got status='{td_stream.status}'."
+        )
+
+    if 'moment' not in moments.data.dims:
+        raise ValueError("Moment data is required: 'moment' dimension was not found.")
+
+    moment_names = np.asarray(moments.data.coords['moment'].values)
+    if 'm1' not in moment_names:
+        raise ValueError(
+            "The first temporal moment 'm1' is required to compute DPF. "
+            f"Available moments: {moment_names.tolist()}"
+        )
+
+    # Select the mean-arrival-time moment (m1)
+    m1 = moments.data.sel(moment='m1')
+
+    # Ensure we have the channel distance coordinate
+    if 'distance' not in moments.data.coords:
+        raise ValueError("TD data does not have a 'distance' coordinate for source-detector separation.")
+
+    rho = moments.data.coords['distance']
+    if moments.data.attrs.get('lengthUnit') == 'mm':
+        rho = rho / 10.0  # convert mm to cm
+
+    c_cm = 2.99792458e10        # Speed of light  [cm/s]
+
+    # Compute DPF = (c / n) * m1 / rho
+    dpf = (c_cm / float(n)) * m1 / rho
+
+    if mode == 'static':
+        if 'time' in dpf.dims:
+            dpf = dpf.mean(dim='time', skipna=True)
+        dpf = dpf.transpose('channel', 'wavelength')
+
+    elif mode == 'timeseries':
+        # Keep time axis when present; otherwise leave as channel/wavelength
+        if 'time' in dpf.dims:
+            dpf = dpf.transpose('time', 'channel', 'wavelength')
+
+    dpf.name = 'dpf'
+    dpf.attrs.update({
+        'description': 'differential pathlength factor',
+        'units': 'dimensionless',
+        'refractive_index': float(n),
+        'formula': 'DPF = (c / n) * m1 / rho',
+        'mode': mode,
+    })
+
+    return dpf
+
+
