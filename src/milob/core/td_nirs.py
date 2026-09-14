@@ -173,7 +173,7 @@ class TD_Stream(NirsStream):
     # ------------------------------------------------------------------
 
     # NEW OPTICAL PROPERTY METHODS USING MOMENTS
-    def moments_to_optical_params(self, inplace=False, n: float = 1.37) -> 'OptPropStream':
+    def moments_to_optical_params(self, n: float = 1.37) -> 'OptPropStream':
         """
         Derive optical properties from TD moments in closed form.
 
@@ -181,11 +181,10 @@ class TD_Stream(NirsStream):
         'moment' dimension and producing an 'op' dimension. Requires
         ``status='moment'``.
 
+        For general-geometry form, see 'fit_to_op_moments'.
+
         Parameters
         ----------
-        inplace : bool
-            Ignored; a new OptPropStream is always returned, since the dimension
-            structure changes.
         n : float
             Refractive index of the medium. Default 1.37.
 
@@ -202,12 +201,6 @@ class TD_Stream(NirsStream):
         from .opt_prop_stream import OptPropStream
 
         optical_data, meta = time_domain.calculate_optical_properties_moments(self, n=n)
-
-        if inplace:
-            self.data = optical_data
-            self.status = "optical"
-            self.history = meta["history"]
-            return self
 
         return OptPropStream(
             data=optical_data,
