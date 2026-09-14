@@ -1,10 +1,9 @@
 import numpy as np
 import xarray as xr
 import copy
-from scipy.optimize import curve_fit, minimize
+from scipy.optimize import curve_fit
 from scipy.signal import convolve
 from scipy.special import erfc
-import re
 
 # ------------------------------------------------------------------
 # Modality conversion
@@ -85,6 +84,7 @@ def calculate_moments(datastream, sheppards_corr=True):
     xr.DataArray
         Shape (time, channel, wavelength, moment) with moment = [m0, m1, m2],
         holding total intensity, mean arrival time and variance.
+        For input into TD_Stream.data, with status='moment'.
     """
     # Select data xarray from datastream
     data_xr = datastream.data
@@ -147,7 +147,7 @@ def apply_irf_correction(datastream_mom, datastream_irf):
     datastream_mom : TD_Stream
         Stream with ``status='moment'``.
     datastream_irf : TD_Stream
-        Stream holding the IRF moments, either time-resolved with dims
+        Stream holding the IRF moments, either timeseries with dims
         (time, channel, wavelength, moment) or static with dims
         (channel, wavelength, moment).
 
@@ -163,7 +163,7 @@ def apply_irf_correction(datastream_mom, datastream_irf):
 
     irf_xr = datastream_irf.data if hasattr(datastream_irf, "data") else datastream_irf
 
-    # --- sanity checks ---
+    # Sanity checks
     required_dims = {"moment", "channel", "wavelength"}
     if not required_dims.issubset(mom_xr.dims):
         raise ValueError("Moment data must contain 'moment', 'channel', 'wavelength'")
@@ -171,7 +171,7 @@ def apply_irf_correction(datastream_mom, datastream_irf):
         raise ValueError("IRF data must contain 'moment', 'channel', 'wavelength'")
     
 
-    # --- extract moments ---
+    # Extract moments and corresponding IRFs
     m0 = mom_xr.sel(moment="m0")
     m1 = mom_xr.sel(moment="m1")
     m2 = mom_xr.sel(moment="m2")
@@ -180,23 +180,21 @@ def apply_irf_correction(datastream_mom, datastream_irf):
     m1_irf = irf_xr.sel(moment="m1")
     m2_irf = irf_xr.sel(moment="m2")
 
-    # --- handle time broadcasting ---
+    # Handle time broadcasting for static IRFs
     if "time" not in m1_irf.dims:
-        # static IRF -> expand to match moment data array time
         m0_irf = m0_irf.expand_dims(time=mom_xr.coords["time"])
         m1_irf = m1_irf.expand_dims(time=mom_xr.coords["time"])
         m2_irf = m2_irf.expand_dims(time=mom_xr.coords["time"])
 
-    # --- apply correction ---
-    # m0_corr = m0 / m0_irf
+    # Apply correction
     m0_corr = m0
     m1_corr = m1 - m1_irf
     m2_corr = m2 - m2_irf
 
-    # ensure variance is non-negative
+    # Ensure variance is non-negative
     m2_corr = xr.where(m2_corr < 0, 0, m2_corr)
 
-    # --- reconstruct data array ---
+    # Reconstruct data array
     corrected_xr = xr.concat([m0_corr, m1_corr, m2_corr], dim="moment")
     corrected_xr.coords['moment'] = ['m0', 'm1', 'm2']
 
@@ -215,7 +213,6 @@ def apply_irf_correction(datastream_mom, datastream_irf):
 # Optical property inversion
 # ------------------------------------------------------------------
 
-# --- MOMENT METHOD ---
 def calculate_optical_properties_moments(datastream_mom, n=1.37):
     """
     Derive optical properties from TD moments in closed form.
@@ -251,22 +248,16 @@ def calculate_optical_properties_moments(datastream_mom, n=1.37):
 
     data = datastream_mom.data
 
-    # --- Extract moments ---
+    # Extract moments
     m1 = data.sel(moment="m1")   # mean time of flight [s]
     m2 = data.sel(moment="m2")   # variance [s^2]
 
-    # --- Geometry ---
-    # distance is only in mm when explicitly tagged as such (see e.g.
-    # FD_Stream.fit_to_op) -- unconditionally dividing by 10 silently
-    # produced a 10x-wrong rho (and therefore a badly wrong musp) for any
-    # stream already storing distances in cm, e.g. every
-    # forward.dos.simulate_*_td_stream output.
-    distances = data.distance
+    # Geometry
+    distances = data.distance               # assumes cm, then corrects for mm if needed
     if data.attrs.get('lengthUnit') == 'mm':
         distances = distances / 10.0
     rho_cm = xr.DataArray(distances, dims=["channel"])
 
-    # --- Constants ---
     c_cm = (3e10 / n)                     # speed of light in medium [cm/s]
 
     # --- Liebert moment formulas ---
@@ -276,11 +267,7 @@ def calculate_optical_properties_moments(datastream_mom, n=1.37):
     # Reduced scattering coefficient μs' [cm^-1]
     mu_sp = (2 * m1 * c_cm * (m1**2 + m2)) / (3 * rho_cm**2 * m2)
 
-    # --- Stack output ---
-    optical_xr = xr.concat(
-        [mu_a, mu_sp],
-        dim="op"
-    )
+    optical_xr = xr.concat([mu_a, mu_sp], dim="op")     # stack output
 
     optical_xr.coords["op"] = ["mua", "musp"]
 
@@ -288,7 +275,7 @@ def calculate_optical_properties_moments(datastream_mom, n=1.37):
         "time", "channel", "wavelength", "op"
     )
 
-    # --- Metadata ---
+    # Metadata
     from ..core.datastream import Datastream
     metadata = {
         "name": datastream_mom.name,
@@ -300,76 +287,6 @@ def calculate_optical_properties_moments(datastream_mom, n=1.37):
     }
 
     optical_xr.attrs["units"] = "cm^-1"
-    # The closed-form relations above work in cm throughout, so record
-    # that explicitly rather than leaving it implicit -- see
-    # core.opt_prop_stream.fit_attrs for the metadata contract.
-    optical_xr.attrs["lengthUnit"] = "cm"
-    optical_xr.attrs["fitting_model"] = "liebert_moments_semi_infinite"
-    optical_xr.attrs["transformation"] = "moments_to_optical_params"
-
-    return optical_xr, metadata
-
-
-# Calculate tissue optical parameters using moments (semi-infinite medium)
-def calculate_optical_params(datastream_mom):
-    """
-    Derive optical properties from the normalised TD moments.
-
-    Assumes a semi-infinite homogeneous medium and uses the mean time of
-    flight and the variance.
-
-    Parameters
-    ----------
-    datastream_mom : TD_Stream
-        Stream with ``status='moment'``.
-
-    Returns
-    -------
-    xr.DataArray
-        Absorption and reduced scattering, in cm^-1.
-
-    References
-    ----------
-    Liebert, A. et al. (2003). Applied Optics, 42(28), 5785-5792.
-    """
-    mom1 = datastream_mom.data.sel(moment='m1') # DTOF (measured) ~ TPSF Kernel accounts for IRF
-    mom2 = datastream_mom.data.sel(moment='m2')
-
-    rho = (datastream_mom.data.distance) / 10 # convert mm to cm
-    n = 1.37
-    c = 3e10 / n # speed of light in units cm/s and corrected for n
-
-    mu_a = (mom1)**3 / (2 * c * mom2 * (mom1**2 + mom2))
-
-    # Reduced scattering coefficient μs' [cm^-1]
-    mu_sp = (2 * mom1 * c * (mom1**2 + mom2)) / (3 * rho**2 * mom2)
-
-    # --- Stack output ---
-    optical_xr = xr.concat(
-        [mu_a, mu_sp],
-        dim="op"
-    )
-
-    optical_xr.coords["op"] = ["mua", "musp"]
-
-    optical_xr = optical_xr.transpose(
-        "time", "channel", "wavelength", "op"
-    )
-
-    # --- Metadata ---
-    metadata = {
-        "name": datastream_mom.name,
-        "events": datastream_mom.events,
-        "status": "optical",
-        "history": datastream_mom.history + [
-            "Computed mua and musp using TD moment relations."
-        ]
-    }
-
-    optical_xr.attrs["units"] = "cm^-1"
-    # The closed-form relations above work in cm throughout, so record
-    # that explicitly rather than leaving it implicit -- see
-    # core.opt_prop_stream.fit_attrs for the metadata contract.
     optical_xr.attrs["lengthUnit"] = "cm"
     optical_xr.attrs["fitting_model"] = "liebert_moments_semi_infinite"
     optical_xr.attrs["transformation"] = "moments_to_optical_params"
