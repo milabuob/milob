@@ -567,33 +567,23 @@ class CW_Stream(NirsStream):
         """
         from ..analysis.glm import GLM
 
-        # 1. Setup a "Nuisance-Only" GLM
-        # We treat the current stream as the target
+        # Setup a "Nuisance-Only" GLM
         model = GLM(self)
 
-        # 2. Create only nuisance regressors (No tasks)
+        # Create only nuisance regressors (No tasks)
         model.create_nuisance_regressors(
             add_drift=add_drift,
             nuisance_method=nuisance_method,
             n_components=n_components
         )
 
-        # Explicitly build a nuisance-only design matrix. Without this, fit()
-        # would build its own via create_design_matrix(include_tasks=True,
-        # ...) since self.design_matrix is still None -- pulling in
-        # self.events to build task regressors even though this method never
-        # asked for tasks. That's wrong regardless of whether events exist:
-        # a stream may have real events intended for a *different* later
-        # step (e.g. splitting into per-task segments for FC), not for use
-        # as GLM regressors here -- and if it has none at all, the auto-build
-        # crashes outright. include_tasks=False rules out both.
+        # Explicitly build a nuisance-only design matrix
         model.create_design_matrix(include_tasks=False, include_nuisance=True)
         
-        # 3. Fit and extract residuals
-        # We reuse the return_residuals=True logic we built for the GLM
+        # Fit and extract residuals
         cleaned_values = model.fit(method=method, return_residuals=True, n_jobs=n_jobs)
         
-        # 4. Return a new stream object with the residuals as the data
+        # Return a new stream object with the residuals as the data
         new_stream = self.copy()
         new_stream.data.values = cleaned_values
         history_params = {
@@ -602,18 +592,8 @@ class CW_Stream(NirsStream):
             'n_components': n_components,
             'method': method,
         }
+        
         if method == 'ar-irls':
-            # ar-irls is one call but two logically distinct processes run
-            # back-to-back on the same design matrix: an AR pre-whitening
-            # filter fit to the residual, then the robust regression on the
-            # whitened data (see GLM._ar_irls_fit). Recorded here rather than
-            # printed so it's queryable provenance, not a transient console
-            # message: nuisance regressors (PCA/short-channel components,
-            # and drift terms alike) are typically slow/tonic, and the
-            # pre-whitening step can suppress exactly that kind of
-            # regressor's fitted coefficient toward zero, undoing the
-            # intended correction. Compare against method='ols'/'robust' to
-            # verify the effect size before trusting these results.
             history_params['steps'] = ['pre_whitening', 'regression']
             history_params['note'] = (
                 "ar-irls runs AR pre-whitening then robust regression as one "
