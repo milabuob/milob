@@ -1,5 +1,6 @@
 from milob.core.cw_nirs import CW_Stream
 from milob.core.opt_prop_stream import OptPropStream
+from milob.core.tissue_stream import TissueStream
 from .datastream import Datastream
 from .nirs import NirsStream
 from ..processing import time_domain
@@ -29,7 +30,7 @@ class TD_Stream(NirsStream):
         super().__init__(data, probe, **kwargs)
 
     # ------------------------------------------------------------------
-    # Modality conversion
+    # TD to CW modality conversion
     # ------------------------------------------------------------------
 
     def to_cw(self) -> 'CW_Stream':
@@ -132,7 +133,6 @@ class TD_Stream(NirsStream):
             history=history
         )
     
-
     def correct_moments_for_irf(self, irf_stream, inplace: bool = False) -> 'TD_Stream':
         """
         Correct measured moments for the instrument response function.
@@ -168,12 +168,53 @@ class TD_Stream(NirsStream):
             history=meta['history']
         )
 
+
+    # ------------------------------------------------------------------
+    # DPF Calculation
+    # ------------------------------------------------------------------
+
+    def calculate_dpf(self, n: float = 1.44, mode: str = 'static'):
+        """
+        Estimate the differential pathlength factor (DPF) from TD moments.
+        This accepts either raw TD data or moment data.
+
+        Parameters
+        ----------
+        n : float, optional
+            Refractive index of the medium. Default 1.44.
+        mode : {'static', 'timeseries'}, optional
+            'static' returns a channel-by-wavelength DPF, collapsing time if
+            present. 'timeseries' retains the time dimension when available.
+
+        Returns
+        -------
+        xarray.DataArray
+            DPF values, with dimensions ('channel', 'wavelength') for static
+            mode, or ('time', 'channel', 'wavelength') for timeseries mode.
+
+        Notes
+        -----
+        The underlying relationship is
+            DPF = (c / n) * m1 / rho
+        """
+        if self.status == 'raw':
+            moments = self.to_moments()
+        elif self.status == 'moment':
+            moments = self
+        else:
+            raise ValueError(
+                f"calculate_dpf() requires TD data with status='raw' or 'moment'; "
+                f"got status='{self.status}'."
+            )
+
+        return time_domain.calculate_dpf_moments(moments, n=n, mode=mode)
+    
+
     # ------------------------------------------------------------------
     # Optical property inversion
     # ------------------------------------------------------------------
 
-    # NEW OPTICAL PROPERTY METHODS USING MOMENTS
-    def moments_to_optical_params(self, inplace=False, n: float = 1.37) -> 'OptPropStream':
+    def moments_to_optical_params(self, n: float = 1.37) -> 'OptPropStream':
         """
         Derive optical properties from TD moments in closed form.
 
@@ -181,11 +222,10 @@ class TD_Stream(NirsStream):
         'moment' dimension and producing an 'op' dimension. Requires
         ``status='moment'``.
 
+        For general-geometry form, see 'fit_to_op_moments'.
+
         Parameters
         ----------
-        inplace : bool
-            Ignored; a new OptPropStream is always returned, since the dimension
-            structure changes.
         n : float
             Refractive index of the medium. Default 1.37.
 
@@ -202,12 +242,6 @@ class TD_Stream(NirsStream):
         from .opt_prop_stream import OptPropStream
 
         optical_data, meta = time_domain.calculate_optical_properties_moments(self, n=n)
-
-        if inplace:
-            self.data = optical_data
-            self.status = "optical"
-            self.history = meta["history"]
-            return self
 
         return OptPropStream(
             data=optical_data,
@@ -310,13 +344,7 @@ class TD_Stream(NirsStream):
             # instrument's raw count scale (or to the arbitrary units this
             # package's own simulate_*_td_stream happens to produce), so A
             # has to be free to land anywhere from a small fraction to many
-            # orders of magnitude above 1 -- verified directly: a
-            # noiseless synthetic fit needed A ~ 1e-22 to match
-            # simulate_si_td_stream's own gated-count convention, far
-            # outside a naively "sensible" (1e-3, 1e12) range, which
-            # instead pinned mua/musp/A all at their bounds with a
-            # confidently wrong answer. Narrow this only once you know your
-            # own data/instrument's actual count scale.
+            # orders of magnitude above 1.
             param_config = {
                 "mua": {"bounds": (1e-3, 0.5), "log": True},
                 "musp": {"bounds": (1.0, 30.0), "log": True},
@@ -679,7 +707,7 @@ class TD_Stream(NirsStream):
         )
 
     def plot_tpsf(self, channel: str, wl: int,
-                  time_pt: int = 100, normalise: bool=False, y_max=None, ax=None):
+                  time_pt: int, normalise: bool=False, y_max=None, ax=None):
         """
         Plot the TPSF for one channel, wavelength and time point.
 
@@ -702,6 +730,9 @@ class TD_Stream(NirsStream):
         -------
         tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes)
         """
+        if wl is None:
+            wl = self.data.wavelength.isel(wavelength=0)
+
         return viz_timedomain.plot_tpsf(
             self, channel=channel,
             wl=wl, time_pt=time_pt, normalise=normalise, y_max=y_max, ax=ax
