@@ -4,6 +4,7 @@ import xarray as xr
 from typing import Union, Optional
 import pandas as pd
 import os
+from ..core.units import cm_per_unit
 
 
 def intensity_to_od(data: Union[np.ndarray, xr.DataArray], 
@@ -159,8 +160,7 @@ def od_to_concentration(od: Union[np.ndarray, xr.DataArray],
         values = od.values
         lambdas = wavelengths if wavelengths is not None else od.coords['wavelength'].values
         distances = distances if distances is not None else od.coords['distance'].values        
-        if od.attrs.get('lengthUnit') == 'mm': # transform to cm
-            distances = distances / 10.0
+        distances = distances * cm_per_unit(od.attrs.get('lengthUnit'), default='cm')
         # Capture dimension names and coordinates for reconstruction
         original_dims = list(od.dims) 
         original_coords = dict(od.coords)

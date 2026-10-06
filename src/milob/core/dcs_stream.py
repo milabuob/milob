@@ -5,6 +5,7 @@ import xarray as xr
 from typing import Optional
 from .datastream import Datastream
 from .nirs import NirsStream
+from .units import cm_per_unit
 
 
 class DCS_Stream(NirsStream):
@@ -198,8 +199,7 @@ class DCS_Stream(NirsStream):
             observation = "siegert" if self.observation == "g2" else "identity"
 
         distances = self.data.coords['distance'].values
-        if self.data.attrs.get('lengthUnit') == 'mm':
-            distances = distances / 10.0
+        distances = distances * cm_per_unit(self.data.attrs.get('lengthUnit'), default='cm')
         distances = np.asarray(distances, dtype=float)
 
         taus = self.taus
@@ -520,7 +520,7 @@ class DCS_Stream(NirsStream):
 
             source_ids = self.data['source'].values
             detector_ids = self.data['detector'].values
-            unit_to_mm = 10.0 if self.probe.lengthUnit == 'cm' else 1.0
+            unit_to_mm = self.probe.mm_per_unit
             detector_positions_mm = self.probe.d_pos[detector_ids - 1] * unit_to_mm  # 1-based -> 0-based
 
             resolved_groups = cluster_channels_by_source(

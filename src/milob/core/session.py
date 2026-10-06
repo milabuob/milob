@@ -1,3 +1,14 @@
+import numpy as np
+from .units import cm_per_unit
+
+
+def _plain_noise(v):
+    """Return a noise specification as a JSON-friendly value."""
+    if v is None:
+        return None
+    if isinstance(v, tuple):
+        return [np.asarray(x, dtype=float).tolist() for x in v]
+    return np.asarray(v, dtype=float).tolist()
 
 
 class Session:
@@ -649,6 +660,51 @@ class Session:
         return stream
     
 
+    @staticmethod
+    def _configure_glm(stream, pipeline):
+        """
+        Return a GLM on ``stream`` with the configuration steps in ``pipeline`` applied.
+        """
+        from ..analysis.glm import GLM
+        model = GLM(stream)
+        for step_name, step_params in (pipeline or []):
+            func = getattr(model, step_name, None)
+            if func:
+                func(**step_params)
+            else:
+                print(f"Warning: GLM has no method '{step_name}'")
+        return model
+
+    def permutation_null(self, stream_input, pipeline, hypotheses, n_perm=1000,
+                         min_shift_s=30.0, seed=0, batch=256):
+        """
+        Build a single-subject permutation null for a GLM fitted with :meth:`run_glm`.
+
+        The same GLM is configured and its task regressors are circularly shifted
+        against the data (OLS; see :meth:`GLM.circular_shift_null`).
+
+        Parameters
+        ----------
+        stream_input : str or Datastream
+            The stream the GLM was fitted on, or its name in this session.
+        pipeline : list
+            The GLM configuration steps passed to :meth:`run_glm`.
+        hypotheses : dict
+            The contrasts passed to :meth:`GLMOutput.compute_contrasts`.
+        n_perm, min_shift_s, seed, batch
+            See :meth:`GLM.circular_shift_null`.
+
+        Returns
+        -------
+        PermutationNull
+            For :meth:`GLMOutput.cluster_inference` with ``method='permutation'``.
+        """
+        stream = self.get_stream(stream_input) if isinstance(stream_input, str) else stream_input
+        model = self._configure_glm(stream, pipeline)
+        return model.circular_shift_null(hypotheses, n_perm=n_perm,
+                                         min_shift_s=min_shift_s, seed=seed,
+                                         batch=batch)
+
     def run_glm(self, stream_input=None, preprocess_pipeline=None, pipeline=None,
                 average_runs=False, method='ar-irls', n_jobs=1):
         """
@@ -682,18 +738,10 @@ class Session:
             per run.
         """
         import logging
-        from ..analysis.glm import GLM
         from ..outputs.output_glm import GLMOutput
 
         def _fit_one(stream):
-            model = GLM(stream)
-            if pipeline:
-                for step_name, step_params in pipeline:
-                    func = getattr(model, step_name, None)
-                    if func:
-                        func(**step_params)
-                    else:
-                        print(f"Warning: GLM has no method '{step_name}'")
+            model = self._configure_glm(stream, pipeline)
             logging.getLogger('milob').info(f"Fitting GLM for {self.subject_id}...")
             return model.fit(method=method, n_jobs=n_jobs)
 
@@ -946,7 +994,8 @@ class Session:
         return f"<Session | {self.name} | Streams: {list(self.streams.keys())}>"
          
 
-    def fit_joint(self, fd_stream, dcs_stream, *, fd_sigma, dcs_sigma,
+    def fit_joint(self, fd_stream, dcs_stream, *, fd_sigma=None, dcs_sigma,
+                  fd_channel_sigma=None,
                   wavelengths=None, param_config=None, fixed_params=None,
                   n=1.33, freq=None, output_name=None, time_index=0,
                   n_starts=None, n_jobs=1, store=True):
@@ -963,10 +1012,17 @@ class Session:
         fd_stream, dcs_stream : str or Datastream
             Stream names in this session, or the streams themselves.
         fd_sigma, dcs_sigma : float
-            Measurement noise for each block. Required, since least squares
-            otherwise weights blocks by point count and units, which misstates the
-            reported uncertainty. ``fd_sigma`` applies to the transformed FD
-            residual and ``dcs_sigma`` to g2(tau).
+            Measurement noise for each block. ``dcs_sigma`` and one of
+            ``fd_sigma`` or ``fd_channel_sigma`` are required, since least
+            squares otherwise weights blocks by point count and units, which
+            misstates the reported uncertainty. ``fd_sigma`` applies to the
+            transformed FD residual and ``dcs_sigma`` to g2(tau).
+        fd_channel_sigma : float, array-like or (amp_sigma, phase_sigma), optional
+            FD noise on each measured channel (relative amplitude noise and
+            phase noise in radians), propagated into the covariance of the
+            transformed residual (see
+            :func:`~milob.processing.fitting.fd_residual_covariance`).
+            Mutually exclusive with ``fd_sigma``.
         wavelengths : float or sequence of float, optional
             Where to evaluate the returned optical properties. Defaults to the DCS
             stream's wavelengths.
@@ -1021,8 +1077,7 @@ class Session:
 
         freq = fd._resolve_freq(freq)
         fd_distances = fd.data.coords['distance'].values
-        if fd.data.attrs.get('lengthUnit') == 'mm':
-            fd_distances = fd_distances / 10.0
+        fd_distances = fd_distances * cm_per_unit(fd.data.attrs.get('lengthUnit'), default='cm')
         fd_distances = np.asarray(fd_distances, dtype=float)
 
         fd_wavelengths = fd.data.wavelength.values
@@ -1047,11 +1102,11 @@ class Session:
                 {"n": n, "wavelength": float(wl), "freq": freq,
                  "eps_hbo": eps_hbo, "eps_hbr": eps_hbr},
                 assemble=assemble_spectral_fd, sigma=fd_sigma,
+                channel_sigma=fd_channel_sigma,
                 name=f"fd_{int(wl)}"))
 
         dcs_distances = dcs.data.coords['distance'].values
-        if dcs.data.attrs.get('lengthUnit') == 'mm':
-            dcs_distances = dcs_distances / 10.0
+        dcs_distances = dcs_distances * cm_per_unit(dcs.data.attrs.get('lengthUnit'), default='cm')
         dcs_wavelengths = dcs.data.wavelength.values
         dcs_arr = dcs.data.values                        # (time, ch, wl, tau)
 
@@ -1080,13 +1135,15 @@ class Session:
             result.tissue.name = f"{base}_comp"
             result.tissue.add_history('session_fit_joint', {
                 'fd_stream': fd.name, 'dcs_stream': dcs.name,
-                'fd_sigma': fd_sigma, 'dcs_sigma': dcs_sigma,
+                'fd_sigma': fd_sigma, 'fd_channel_sigma': _plain_noise(fd_channel_sigma),
+                'dcs_sigma': dcs_sigma,
                 'n_blocks': len(blocks), 'time_index': time_index})
         if result.optical is not None:
             result.optical.name = f"{base}_op"
             result.optical.add_history('session_fit_joint', {
                 'fd_stream': fd.name, 'dcs_stream': dcs.name,
-                'fd_sigma': fd_sigma, 'dcs_sigma': dcs_sigma,
+                'fd_sigma': fd_sigma, 'fd_channel_sigma': _plain_noise(fd_channel_sigma),
+                'dcs_sigma': dcs_sigma,
                 'n_blocks': len(blocks), 'time_index': time_index})
 
         if store:

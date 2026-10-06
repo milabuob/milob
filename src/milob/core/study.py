@@ -5,12 +5,11 @@ import json
 import warnings
 import numpy as np
 import xarray as xr
-from scipy import stats
 from glob import glob
 from .. import __version__
 from .session import Session
 from .datastream import Datastream
-from ..outputs.output_glm import GLMOutput
+from ..outputs.output_glm import GLMOutput, _p_and_significance
 
 class Study:
     def __init__(self, name, data_path):
@@ -759,7 +758,8 @@ class Study:
             'skipped': skipped,
         }
 
-    def get_group_stats(self, method='weighted', alpha=0.05):
+    def get_group_stats(self, method='weighted', alpha=0.05, tail='two',
+                        keep_subject_maps=True):
         """
         Run a group-level analysis over the subject-level contrasts.
 
@@ -776,14 +776,29 @@ class Study:
             ``1 / (v_within + tau^2)``, and reduces to 'simple' when the
             subject-level variances are homogeneous.
         alpha : float
-            Two-tailed significance threshold. Default 0.05.
+            Significance threshold for ``is_significant``. Default 0.05.
+        tail : {'two', 'directional'}
+            'two' (default) tests ``beta != 0``. 'directional' tests
+            ``beta > 0`` for HbO/HbT and ``beta < 0`` for HbR.
+        keep_subject_maps : bool
+            Also store the stacked subject estimates as ``subject_beta`` and
+            ``subject_var``. Required by :meth:`GLMOutput.cluster_inference`.
+            Default True.
 
         Returns
         -------
         GLMOutput
             Group-level estimates, standard errors, t-statistics and
             significance mask.
+
+        Raises
+        ------
+        ValueError
+            If ``method`` or ``tail`` is unknown.
         """
+        if method not in ('simple', 'weighted'):
+            raise ValueError(f"method must be 'simple' or 'weighted', got {method!r}.")
+
         # Find all unique contrast names across all subjects
         all_contrast_names = set()
         for s in self.sessions:
@@ -831,16 +846,24 @@ class Study:
             
             # Compute stats for contrast con
             if method == 'simple':
-                res_ds = self._run_simple_group(group_betas, alpha)
-            elif method == 'weighted':
-                res_ds = self._run_weighted_group(group_betas, group_vars, alpha)
+                res_ds = self._run_simple_group(group_betas, alpha, tail)
+            else:
+                res_ds = self._run_weighted_group(group_betas, group_vars, alpha, tail)
+            if keep_subject_maps:
+                res_ds['subject_beta'] = group_betas.transpose('subject', *res_ds['beta'].dims)
+                res_ds['subject_var'] = group_vars.transpose('subject', *res_ds['beta'].dims)
                 
             # Add the contrast label back to the dataset:
             group_results_list.append(res_ds.expand_dims(contrast=[con]))
             
         # Merge all contrasts into one single Output object
         combined_group_ds = xr.concat(group_results_list, dim='contrast')
-        
+        # No scalar 'df' here: it is n_subjects - 1 per cell, carried as the
+        # 'n_subjects' variable.
+        combined_group_ds.attrs['tail'] = tail
+        # What produced beta/se, so residuals can be rebuilt consistently.
+        combined_group_ds.attrs['group_method'] = method
+
         # Find probe info -- Session has no single "session probe" of its
         # own (it can hold streams with genuinely different probes, e.g.
         # different modalities), so pull one from whichever loaded stream
@@ -898,7 +921,7 @@ class Study:
             f"'wavelength' as a payload dimension; got {Y_sub.dims}."
         )
 
-    def _run_weighted_group(self, Y_sub, Var_sub, alpha):
+    def _run_weighted_group(self, Y_sub, Var_sub, alpha, tail='two'):
         """
         Run a DerSimonian-Laird random-effects group model.
 
@@ -914,7 +937,9 @@ class Study:
         Var_sub : xr.DataArray
             Within-subject variance of those estimates, same shape.
         alpha : float
-            Two-tailed significance threshold.
+            Significance threshold for ``is_significant``.
+        tail : {'two', 'directional'}
+            See :meth:`get_group_stats`.
 
         Returns
         -------
@@ -964,16 +989,16 @@ class Study:
             se = np.sqrt(_safe_div(np.ones_like(sw), sw))
             t_stats = _safe_div(beta, se)
 
-        df = np.maximum(n_sub - 1, 1)
-        p_vals = 2 * (1 - stats.t.cdf(np.abs(t_stats), df))
-
         enough = n_sub >= 2
         beta = np.where(n_sub > 0, beta, np.nan)
-        for arr in (t_stats, p_vals, se):
+        for arr in (t_stats, se):
             arr[~enough] = np.nan
 
         pdim = self._payload_dim(Y_sub)
         dims = [space, pdim]
+        p_vals, is_sig = _p_and_significance(
+            t_stats, np.maximum(n_sub - 1, 1), alpha, tail,
+            list(Y_sub[pdim].values), dims.index(pdim))
         return xr.Dataset({
             'beta': (dims, beta),
             'se': (dims, se),
@@ -981,11 +1006,11 @@ class Study:
             'p_val': (dims, p_vals),
             'tau_sq': (dims, tau_sq),
             'n_subjects': (dims, n_sub),
-            'is_significant': (dims, (p_vals < alpha) & enough),
+            'is_significant': (dims, is_sig & enough),
         }, coords={space: Y_sub[space], pdim: Y_sub[pdim]})
 
 
-    def _run_simple_group(self, Y_sub, alpha):
+    def _run_simple_group(self, Y_sub, alpha, tail='two'):
         """
         Run an unweighted one-sample t-test across subjects.
 
@@ -994,7 +1019,9 @@ class Study:
         Y_sub : xr.DataArray
             Subject contrast estimates, with dims (subject, <spatial>, payload).
         alpha : float
-            Two-tailed significance threshold.
+            Significance threshold for ``is_significant``.
+        tail : {'two', 'directional'}
+            See :meth:`get_group_stats`.
 
         Returns
         -------
@@ -1002,7 +1029,6 @@ class Study:
             Group estimate, standard error, t-statistic and significance mask.
         """
         import numpy as np
-        from scipy import stats
 
         # Identify valid data points
         valid_mask = ~np.isnan(Y_sub.values)    # (subject, channel, chromophore)
@@ -1020,28 +1046,26 @@ class Study:
         standard_error = group_std / np.sqrt(n_sub_per_cell + 1e-10)    # Add epsilon to denominator to prevent division by zero
         t_stats = group_beta / (standard_error + 1e-10)
         
-        # Degrees of Freedom and P-values
-        df = n_sub_per_cell - 1
-        df_clipped = np.maximum(df, 1)  # Set a floor of 1 for DF to avoid math errors (though T-test needs > 1)
-        
-        p_vals = 2 * (1 - stats.t.cdf(np.abs(t_stats), df_clipped))
-        
         # Mask out results where N < 2 (cannot do a T-test with 1 or 0 subjects)
         insufficient_data = n_sub_per_cell < 2
         t_stats[insufficient_data] = np.nan
-        p_vals[insufficient_data] = np.nan
 
         # Package into Xarray Dataset
         space = self._spatial_dim(Y_sub)
         pdim = self._payload_dim(Y_sub)
         dims = [space, pdim]
+
+        # Floor of 1 for df only to keep scipy quiet; those cells are NaN.
+        p_vals, is_sig = _p_and_significance(
+            t_stats, np.maximum(n_sub_per_cell - 1, 1), alpha, tail,
+            list(Y_sub[pdim].values), dims.index(pdim))
         ds_group = xr.Dataset({
             'beta': (dims, group_beta),
             'se': (dims, standard_error),
             't_stat': (dims, t_stats),
             'p_val': (dims, p_vals),
             'n_subjects': (dims, n_sub_per_cell),
-            'is_significant': (dims, p_vals < alpha)
+            'is_significant': (dims, is_sig)
         }, coords={space: Y_sub[space], pdim: Y_sub[pdim]})
 
         return ds_group

@@ -3,6 +3,19 @@ import xarray as xr
 from typing import Optional
 from .datastream import Datastream
 from .nirs import NirsStream
+from .units import cm_per_unit
+
+
+def _noise_record(sigma, channel_sigma, absolute_sigma):
+    """Return the fit's noise settings as JSON-friendly history entries."""
+    def _plain(v):
+        if v is None:
+            return None
+        if isinstance(v, tuple):
+            return [np.asarray(x, dtype=float).tolist() for x in v]
+        return np.asarray(v, dtype=float).tolist()
+    return {'sigma': _plain(sigma), 'channel_sigma': _plain(channel_sigma),
+            'absolute_sigma': bool(absolute_sigma)}
 
 
 class FD_Stream(NirsStream):
@@ -67,7 +80,7 @@ class FD_Stream(NirsStream):
         return read_oxiplex(filepath, detector, wavelength_mask, sc_threshold=sc_threshold, **kwargs)
 
     @classmethod
-    def read_iss(cls, datafile, layout_file, *, modulation_frequency, sc_threshold=None, **kwargs):
+    def from_imagent(cls, datafile, layout_file, *, modulation_frequency, sc_threshold=None, **kwargs):
         """
         Load an ISS Imagent BOXY record with its probe layout file.
 
@@ -284,6 +297,7 @@ class FD_Stream(NirsStream):
                   n_jobs: int = 1,
                   sigma: Optional[float] = None,
                   absolute_sigma: bool = False,
+                  channel_sigma=None,
                   **residual_kwargs) -> 'OptPropStream':
         """
         Derive optical properties by nonlinear least-squares fitting.
@@ -332,8 +346,16 @@ class FD_Stream(NirsStream):
             Known per-point noise level on the transformed residual. If None, the
             reported uncertainty is self-calibrated from each slice's residual.
         absolute_sigma : bool
-            Anchor the uncertainty to ``sigma`` rather than self-calibrating.
-            Default False.
+            Anchor the uncertainty to ``sigma`` or ``channel_sigma`` rather
+            than self-calibrating. Default False.
+        channel_sigma : float, array-like or (amp_sigma, phase_sigma), optional
+            Known noise on each measured channel: relative amplitude noise
+            (std of ln A) and phase noise in radians. A single value is used
+            for both, and is shared by every wavelength. The noise is
+            propagated through ``residual_transform`` into the full residual
+            covariance (see
+            :func:`~milob.processing.fitting.fd_residual_covariance`).
+            Mutually exclusive with ``sigma``.
         **residual_kwargs
             Forwarded to the residual transform.
 
@@ -367,8 +389,7 @@ class FD_Stream(NirsStream):
 
         if distances is None:
             distances = self.data.coords['distance'].values
-            if self.data.attrs.get('lengthUnit') == 'mm':
-                distances = distances / 10.0
+            distances = distances * cm_per_unit(self.data.attrs.get('lengthUnit'), default='cm')
         distances = np.asarray(distances, dtype=float)
 
         # Plain array, not the xarray object -- lightweight to close over
@@ -425,6 +446,7 @@ class FD_Stream(NirsStream):
                 n_jobs=inner_n_jobs,
                 sigma=sigma,
                 absolute_sigma=absolute_sigma,
+                channel_sigma=channel_sigma,
                 return_covariance=True,
                 **residual_kwargs,
             )
@@ -474,6 +496,7 @@ class FD_Stream(NirsStream):
             'forward_model': getattr(forward_model, '__name__', 'custom'),
             'residual_transform': residual_transform if isinstance(residual_transform, str) else 'custom',
             'n_starts': n_starts,
+            **_noise_record(sigma, channel_sigma, absolute_sigma),
         }))
 
         return OptPropStream(
@@ -504,6 +527,7 @@ class FD_Stream(NirsStream):
                      n_jobs: int = 1,
                      sigma: Optional[float] = None,
                      absolute_sigma: bool = False,
+                     channel_sigma=None,
                      **residual_kwargs) -> 'TissueStream':
         """
         Fit tissue composition and scattering shape directly from the raw data.
@@ -554,8 +578,16 @@ class FD_Stream(NirsStream):
             Known per-point noise level on the transformed residual. If None, the
             reported uncertainty is self-calibrated from each slice's residual.
         absolute_sigma : bool
-            Anchor the uncertainty to ``sigma`` rather than self-calibrating.
-            Default False.
+            Anchor the uncertainty to ``sigma`` or ``channel_sigma`` rather
+            than self-calibrating. Default False.
+        channel_sigma : float, array-like or (amp_sigma, phase_sigma), optional
+            Known noise on each measured channel: relative amplitude noise
+            (std of ln A) and phase noise in radians. A single value is used
+            for both, and is shared by every wavelength. The noise is
+            propagated through ``residual_transform`` into the full residual
+            covariance (see
+            :func:`~milob.processing.fitting.fd_residual_covariance`).
+            Mutually exclusive with ``sigma``.
         **residual_kwargs
             Forwarded to the residual transform.
 
@@ -596,8 +628,7 @@ class FD_Stream(NirsStream):
 
         if distances is None:
             distances = self.data.coords['distance'].values
-            if self.data.attrs.get('lengthUnit') == 'mm':
-                distances = distances / 10.0
+            distances = distances * cm_per_unit(self.data.attrs.get('lengthUnit'), default='cm')
         distances = np.asarray(distances, dtype=float)
 
         # Plain array, not the xarray object -- lightweight to close over
@@ -686,6 +717,7 @@ class FD_Stream(NirsStream):
                 n_jobs=inner_n_jobs,
                 sigma=sigma,
                 absolute_sigma=absolute_sigma,
+                channel_sigma=channel_sigma,
                 return_covariance=True,
                 **residual_kwargs,
             )
@@ -742,6 +774,7 @@ class FD_Stream(NirsStream):
             'assemble': getattr(assemble, '__name__', 'custom'),
             'residual_transform': residual_transform if isinstance(residual_transform, str) else 'custom',
             'n_starts': n_starts,
+            **_noise_record(sigma, channel_sigma, absolute_sigma),
         }))
 
         return TissueStream(

@@ -819,9 +819,6 @@ def _iter_recordings(session):
     """
     Yield each stream to export, with its identifiers and entities.
 
-    A session holding a participants mapping is flattened into those
-    participants, each tagged with a recording entity.
-
     Parameters
     ----------
     session : Session
@@ -833,17 +830,6 @@ def _iter_recordings(session):
         Subject, session identifier, the holder object, the stream name and
         its filename entities.
     """
-    participants = getattr(session, 'participants', None)
-
-    if participants:
-        for role, child in participants.items():
-            for stream_name in _stream_keys(child):
-                entities = entities_from_stream_name(stream_name)
-                entities.setdefault('recording', role)
-                yield (getattr(session, 'dyad_id', child.subject_id),
-                       session.session_id, child, stream_name, entities)
-        return
-
     for stream_name in _stream_keys(session):
         yield (session.subject_id, session.session_id, session, stream_name,
                entities_from_stream_name(stream_name))

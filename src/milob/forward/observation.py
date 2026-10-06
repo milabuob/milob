@@ -10,19 +10,14 @@ import numpy as np
 from scipy.special import erfc
 
 
-#: Fitted parameters that belong to B, not to the medium. When a fit is
-#: unpacked into a ``core.opt_prop_stream.OptPropStream`` these are routed
-#: to ``obs_params`` rather than onto the ``op`` axis, so ``op`` holds only
-#: recovered properties of the tissue (see that class, and the
-#: milob-package-design skill's invariant 4 -- keeping B out of the forward
-#: model is only half the separation if B's parameters then get stored as
-#: though they were optical properties).
-#:
-#: ``beta`` is the Siegert coherence factor. Future additions land here as
-#: they become fittable: IRF shape parameters (see ``emg_irf``), detector
-#: dark counts, FD amplitude/phase calibration, interferometric reference
-#: terms.
-OBSERVATION_PARAMS = frozenset({"beta"})
+#: Fitted parameters that describe the instrument rather than the medium.
+#: When a fit is unpacked into an ``OptPropStream`` these are stored on
+#: ``obs_params`` instead of the ``op`` axis. ``beta`` is the Siegert
+#: coherence factor; ``irf_t0``, ``irf_sigma`` and ``irf_tau`` are the shape
+#: parameters of the parametric TD instrument response (see
+#: :func:`emg_irf_from_params`).
+EMG_IRF_PARAMS = ("irf_t0", "irf_sigma", "irf_tau")
+OBSERVATION_PARAMS = frozenset({"beta", *EMG_IRF_PARAMS})
 
 
 def is_observation_param(name):
@@ -142,7 +137,8 @@ def emg_irf(t, t0, sigma, tau):
     Evaluate an exponentially modified Gaussian instrument response.
 
     The fallback response for :func:`convolve_irf` when none was measured. Its
-    shape parameters can be fitted jointly with the optical properties.
+    shape parameters can be fitted jointly with the optical properties
+    through :func:`emg_irf_from_params`.
 
     Parameters
     ----------
@@ -178,3 +174,45 @@ def emg_irf(t, t0, sigma, tau):
     term2 = erfc(np.clip(term2_arg, -20, 20))
 
     return term1 * term2
+
+
+def emg_irf_from_params(t, flat):
+    """
+    Evaluate :func:`emg_irf` from a flat dictionary of fit parameters.
+
+    This is the response used when ``irf="emg"`` is passed to
+    :func:`~milob.processing.fitting.td_model_opt` or
+    ``TD_Stream.fit_to_op``. The parameter names are listed in
+    ``OBSERVATION_PARAMS``, so fitted values are stored on
+    ``OptPropStream.obs_params`` rather than with the optical properties.
+
+    With ``mua`` and ``musp`` also free, a single TPSF constrains the shape
+    weakly: ``irf_t0`` trades off against ``musp``. Fix the shape through
+    ``fixed_params`` when it is known, or fit several source-detector
+    distances that share one response.
+
+    Parameters
+    ----------
+    t : array-like
+        Time grid in seconds.
+    flat : dict
+        Must contain ``irf_t0``, ``irf_sigma`` and ``irf_tau`` in seconds,
+        fitted or held fixed.
+
+    Returns
+    -------
+    np.ndarray
+        Response evaluated at ``t``.
+
+    Raises
+    ------
+    KeyError
+        If any of the three shape parameters is missing.
+    """
+    missing = [k for k in EMG_IRF_PARAMS if k not in flat]
+    if missing:
+        raise KeyError(
+            f"emg_irf_from_params needs {list(EMG_IRF_PARAMS)} in param_config, "
+            f"fixed_params or forward_parameters; missing {missing}."
+        )
+    return emg_irf(t, flat["irf_t0"], flat["irf_sigma"], flat["irf_tau"])

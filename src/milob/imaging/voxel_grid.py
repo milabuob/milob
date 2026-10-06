@@ -196,19 +196,15 @@ class VoxelGrid:
         s_pos = probe.s_pos.astype(float)
         d_pos = probe.d_pos.astype(float)
         distances = np.asarray(probe.distances, dtype=float)
-        if probe.lengthUnit == 'cm':
-            s_pos = s_pos * 10.0
-            d_pos = d_pos * 10.0
-            distances = distances * 10.0
+        scale = probe.mm_per_unit
+        s_pos, d_pos, distances = s_pos * scale, d_pos * scale, distances * scale
         optodes = np.vstack([s_pos, d_pos])
 
         if coreg is not None:
             optodes = coreg.apply(optodes)
             channel_mids = coreg.mni_channel_midpoints
         else:
-            channel_mids = probe.channel_midpoints.astype(float)
-            if probe.lengthUnit == 'cm':
-                channel_mids = channel_mids * 10.0
+            channel_mids = probe.channel_midpoints.astype(float) * probe.mm_per_unit
 
         boundary_point, boundary_normal = fit_boundary_plane(optodes)
 
@@ -319,17 +315,15 @@ class VoxelGrid:
         s_pos = probe.s_pos.astype(float)
         d_pos = probe.d_pos.astype(float)
         distances = np.asarray(probe.distances, dtype=float)
-        if probe.lengthUnit == 'cm':
-            s_pos, d_pos, distances = s_pos * 10.0, d_pos * 10.0, distances * 10.0
+        scale = probe.mm_per_unit
+        s_pos, d_pos, distances = s_pos * scale, d_pos * scale, distances * scale
         optodes = np.vstack([s_pos, d_pos])
 
         if coreg is not None:
             optodes = coreg.apply(optodes)
             channel_mids = coreg.mni_channel_midpoints
         else:
-            channel_mids = probe.channel_midpoints.astype(float)
-            if probe.lengthUnit == 'cm':
-                channel_mids = channel_mids * 10.0
+            channel_mids = probe.channel_midpoints.astype(float) * probe.mm_per_unit
 
         if channel_mask is not None:
             channel_mask = np.asarray(channel_mask, dtype=bool)
