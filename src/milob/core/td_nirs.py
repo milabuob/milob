@@ -1,5 +1,6 @@
 from milob.core.cw_nirs import CW_Stream
 from milob.core.opt_prop_stream import OptPropStream
+from milob.core.tissue_stream import TissueStream
 from .datastream import Datastream
 from .nirs import NirsStream
 from ..processing import time_domain
@@ -30,7 +31,7 @@ class TD_Stream(NirsStream):
         super().__init__(data, probe, **kwargs)
 
     # ------------------------------------------------------------------
-    # Modality conversion
+    # TD to CW modality conversion
     # ------------------------------------------------------------------
 
     def to_cw(self) -> 'CW_Stream':
@@ -133,7 +134,6 @@ class TD_Stream(NirsStream):
             history=history
         )
     
-
     def correct_moments_for_irf(self, irf_stream, inplace: bool = False) -> 'TD_Stream':
         """
         Correct measured moments for the instrument response function.
@@ -168,6 +168,7 @@ class TD_Stream(NirsStream):
             status='moment',
             history=meta['history']
         )
+
 
     # ------------------------------------------------------------------
     # Differential pathlength factor
@@ -204,8 +205,7 @@ class TD_Stream(NirsStream):
     # Optical property inversion
     # ------------------------------------------------------------------
 
-    # NEW OPTICAL PROPERTY METHODS USING MOMENTS
-    def moments_to_optical_params(self, inplace=False, n: float = 1.37) -> 'OptPropStream':
+    def moments_to_optical_params(self, n: float = 1.37) -> 'OptPropStream':
         """
         Derive optical properties from TD moments in closed form.
 
@@ -213,11 +213,10 @@ class TD_Stream(NirsStream):
         'moment' dimension and producing an 'op' dimension. Requires
         ``status='moment'``.
 
+        For general-geometry form, see 'fit_to_op_moments'.
+
         Parameters
         ----------
-        inplace : bool
-            Ignored; a new OptPropStream is always returned, since the dimension
-            structure changes.
         n : float
             Refractive index of the medium. Default 1.37.
 
@@ -234,12 +233,6 @@ class TD_Stream(NirsStream):
         from .opt_prop_stream import OptPropStream
 
         optical_data, meta = time_domain.calculate_optical_properties_moments(self, n=n)
-
-        if inplace:
-            self.data = optical_data
-            self.status = "optical"
-            self.history = meta["history"]
-            return self
 
         return OptPropStream(
             data=optical_data,
@@ -704,7 +697,7 @@ class TD_Stream(NirsStream):
         )
 
     def plot_tpsf(self, channel: str, wl: int,
-                  time_pt: int = 100, normalise: bool=False, y_max=None, ax=None):
+                  time_pt: int, normalise: bool=False, y_max=None, ax=None):
         """
         Plot the TPSF for one channel, wavelength and time point.
 
@@ -727,6 +720,9 @@ class TD_Stream(NirsStream):
         -------
         tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes)
         """
+        if wl is None:
+            wl = self.data.wavelength.isel(wavelength=0)
+
         return viz_timedomain.plot_tpsf(
             self, channel=channel,
             wl=wl, time_pt=time_pt, normalise=normalise, y_max=y_max, ax=ax

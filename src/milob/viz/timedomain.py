@@ -75,7 +75,7 @@ def _get_meta(datastream, key):
     return None
 
 
-def plot_tpsf(datastream, channel="S1D1", wl=690, time_pt=100, normalise=False,
+def plot_tpsf(datastream, channel="S1D1", wl=None, time_pt=0, normalise=False,
                y_max=None, ax=None):
     """
     Plot the temporal point spread function for one channel and wavelength.
@@ -87,9 +87,9 @@ def plot_tpsf(datastream, channel="S1D1", wl=690, time_pt=100, normalise=False,
     channel : str, optional
         Channel label. Default is ``'S1D1'``.
     wl : int, optional
-        Wavelength in nm. Default is 690.
+        Wavelength in nm. Default is wl_idx 0.
     time_pt : int, optional
-        Index of the sampling time to plot. Default is 100.
+        Index of the sampling time to plot. Default is first time point, 0.
     normalise : bool, optional
         Normalise the counts to sum to one. Default is False.
     y_max : float, optional
@@ -129,9 +129,6 @@ def plot_tpsf(datastream, channel="S1D1", wl=690, time_pt=100, normalise=False,
         width = bin_widths[0] if isinstance(bin_widths, (list, np.ndarray)) else bin_widths
 
     if normalise:
-        # nansum, not sum: a stray NaN in tpsf_counts would otherwise make
-        # `total` NaN and silently normalise every bin (not just the NaN
-        # one) to NaN.
         total = np.nansum(tpsf_counts)
         if total != 0:
             tpsf_counts = tpsf_counts / total
