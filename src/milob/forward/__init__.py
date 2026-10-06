@@ -17,17 +17,25 @@ from .dcs import (si_dcs_g1, two_layer_dcs_g1, n_layer_dcs_g1, simulate_dcs_stre
                    assemble_two_layer_dcs, TWO_LAYER_DCS_PARAM_CONFIG,
                    make_assemble_n_layer_dcs, make_n_layer_dcs_param_config)
 from . import observation
-from .observation import OBSERVATION_PARAMS, is_observation_param, split_fit_params
+from .observation import (OBSERVATION_PARAMS, EMG_IRF_PARAMS, is_observation_param,
+                          split_fit_params, emg_irf_from_params)
 from .dynamics import (BFI_PARAM, BFI_LABEL, bfi_param_name, to_storage_label,
                         from_storage_label, flow_unit)
-from .noise_models import zhou_noise_model
+from .noise_models import zhou_noise_model, fd_noise_model, fd_noise_sigma
+from . import jacobian
+from .jacobian import si_greens_adapter, build_jacobian
+from . import sensitivity
+from .sensitivity import SensitivityOperator
 
 __all__ = [
     "kernels", "dynamics", "dispersion", "observation", "spectral", "noise_models",
+    "jacobian", "si_greens_adapter", "build_jacobian",
+    "sensitivity", "SensitivityOperator",
     "OBSERVATION_PARAMS", "is_observation_param", "split_fit_params",
+    "EMG_IRF_PARAMS", "emg_irf_from_params",
     "BFI_PARAM", "BFI_LABEL", "bfi_param_name", "to_storage_label",
     "from_storage_label", "flow_unit",
-    "zhou_noise_model",
+    "zhou_noise_model", "fd_noise_model", "fd_noise_sigma",
     "mua_from_composition", "musp_powerlaw", "extinction_at",
     "assemble_spectral_fd", "assemble_spectral_dcs",
     "TISSUE_FD_PARAM_CONFIG", "TISSUE_DCS_PARAM_CONFIG",

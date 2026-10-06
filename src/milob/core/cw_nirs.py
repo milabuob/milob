@@ -431,6 +431,157 @@ class CW_Stream(NirsStream):
         return target
 
 
+    def estimate_hr(self,
+                     freq_range: Tuple[float, float] = (0.7, 2.2),
+                     window_length: float = 10.0,
+                     step_size=None,
+                     min_cycles: int = 3,
+                     channel_selection: str = 'short',
+                     weight_by_quality: bool = True,
+                     name: Optional[str] = None):
+        """
+        Estimate heart rate from the cardiac pulsation in intensity or OD data.
+
+        The selected channels are averaged over wavelength, z-scored, combined
+        (optionally weighted by PSP or SCI) and passed to
+        :func:`~milob.processing.cardiac.estimate_hr_from_trace`. Bad channels
+        are excluded.
+
+        Parameters
+        ----------
+        freq_range : tuple of float
+            Cardiac band in Hz. Default (0.7, 2.2).
+        window_length : float
+            Window length in seconds. Default 10.
+        step_size : float, optional
+            Step between windows in seconds. Default ``window_length / 2``.
+        min_cycles : int
+            Minimum cardiac cycles per window. Default 3.
+        channel_selection : {'short', 'long', 'all'}
+            Channels to combine. 'short' (default) falls back to the long
+            channels, with a warning, when there are no short channels.
+        weight_by_quality : bool
+            Weight channels by the 'psp' or 'sci' coordinate when present
+            (from :meth:`psp_screen` or :meth:`sci_screen`). Default True.
+        name : str, optional
+            Name of the returned stream. Default ``'{name}_hr'``.
+
+        Returns
+        -------
+        AuxStream
+            Signals 'hr' (beats per minute) and 'hr_confidence', one sample per
+            window.
+
+        Raises
+        ------
+        ValueError
+            If the data has no wavelength dimension, the status is not 'raw',
+            'processed' or 'od', ``channel_selection`` is unknown, or no usable
+            channel remains.
+        """
+        import warnings as _warnings
+        import xarray as xr
+        from ..processing.cardiac import estimate_hr_from_trace
+        from .auxiliary import AuxStream
+
+        if 'wavelength' not in self.data.dims:
+            raise ValueError(
+                "estimate_hr requires OD/intensity data with a 'wavelength' dimension."
+            )
+        if self.status not in ('raw', 'processed', 'od'):
+            raise ValueError(
+                f"estimate_hr expects raw intensity or OD data (status 'raw', 'processed', "
+                f"or 'od'), got status='{self.status}'. Cardiac pulsation extraction assumes "
+                f"an intensity-like signal, not a post-MBLL derived quantity. 'processed' "
+                f"means filtered/motion-corrected/quality-screened raw intensity -- still "
+                f"intensity-like, so it's allowed here same as 'raw'."
+            )
+
+        fs = self.data.attrs.get('sampling_rate')
+        if fs is None:
+            fs = 1.0 / np.nanmean(np.diff(self.data.time.values))
+
+        is_short = self.data.coords.get('is_short')
+        is_bad = self.data.coords.get('is_bad')
+        n_channels = self.data.sizes['channel']
+
+        if channel_selection == 'short':
+            sel = is_short.values.copy() if is_short is not None else np.ones(n_channels, dtype=bool)
+            if is_short is None or not sel.any():
+                _warnings.warn(
+                    "No short-separation channels found on this probe; "
+                    "falling back to long channels for HR estimation.", RuntimeWarning
+                )
+                sel = (~is_short.values) if is_short is not None else np.ones(n_channels, dtype=bool)
+        elif channel_selection == 'long':
+            sel = (~is_short.values) if is_short is not None else np.ones(n_channels, dtype=bool)
+        elif channel_selection == 'all':
+            sel = np.ones(n_channels, dtype=bool)
+        else:
+            raise ValueError("channel_selection must be one of 'short', 'long', 'all'.")
+
+        if is_bad is not None:
+            sel = sel & ~is_bad.values
+        if not sel.any():
+            raise ValueError("No usable (non-bad) channels available for HR estimation.")
+
+        # Cardiac pulsation is present at every wavelength; average across
+        # wavelength first (this is not a chromophore-unmixing step), then
+        # across the selected channels.
+        chan_data = self.data.isel(channel=sel).mean('wavelength')  # (time, channel)
+
+        weights = None
+        if weight_by_quality:
+            for qkey in ('psp', 'sci'):
+                if qkey in chan_data.coords:
+                    w = np.clip(chan_data.coords[qkey].values, 0, None)
+                    if np.isfinite(w).any() and np.nansum(w) > 0:
+                        weights = w
+                        break
+
+        values = chan_data.values  # (time, n_sel_channels)
+        # Mask +/-inf (possible in OD) as well as NaN.
+        values = np.where(np.isfinite(values), values, np.nan)
+        # z-score each channel so channels of unequal amplitude don't dominate
+        mean = np.nanmean(values, axis=0, keepdims=True)
+        std = np.nanstd(values, axis=0, keepdims=True)
+        std[std == 0] = np.nan
+        z = (values - mean) / std
+
+        if weights is not None:
+            trace = np.nansum(z * weights, axis=1) / np.nansum(weights)
+        else:
+            trace = np.nanmean(z, axis=1)
+
+        times, hr_bpm, confidence = estimate_hr_from_trace(
+            trace, fs=fs, freq_range=freq_range, window_length=window_length,
+            step_size=step_size, min_cycles=min_cycles,
+        )
+
+        abs_times = self.data.time.values[0] + times
+        out = xr.DataArray(
+            np.stack([hr_bpm, confidence], axis=-1),
+            dims=('time', 'signal'),
+            coords={'time': abs_times, 'signal': ['hr', 'hr_confidence']},
+        )
+
+        hr_stream = AuxStream(out, signal_type='hr', name=name or f"{self.name}_hr")
+        if len(abs_times) > 1:
+            hr_stream.data.attrs['sampling_rate'] = 1.0 / np.median(np.diff(abs_times))
+        hr_stream.data.attrs['units'] = 'bpm'
+        hr_stream.add_history('estimate_hr', {
+            'source_stream': self.name,
+            'input_status': self.status,
+            'freq_range': freq_range,
+            'window_length': window_length,
+            'step_size': step_size if step_size is not None else window_length / 2,
+            'min_cycles': min_cycles,
+            'channel_selection': channel_selection,
+            'n_channels_used': int(sel.sum()),
+            'weighted': weights is not None,
+        })
+        return hr_stream
+
     def to_od(self, baseline=None, baseline_window=None, inplace=False):
         """
         Convert intensity to optical density.
@@ -527,9 +678,218 @@ class CW_Stream(NirsStream):
         target.add_history('mbll', {'dpf': np.atleast_1d(dpf).tolist()})
         return target
 
+    def reconstruct(self, operator, mua0=None, musp0=None, n: float = 1.4, *, R_eff=None,
+                     greens_fn=None, phi0_source: str = "model", phi0_measured=None,
+                     jacobian_fn=None, jacobian_kwargs: Optional[dict] = None,
+                     alpha: Optional[float] = None, lambda1: Optional[float] = None,
+                     lambda2: Optional[float] = None,
+                     method: str = "svd", channel_noise=None,
+                     channel_mask=None, inplace: bool = False) -> "OptPropStream":
+        """
+        Reconstruct an absorption change on a voxel grid from OD.
+
+        Builds one sensitivity matrix per wavelength and applies a Tikhonov
+        inverse (:func:`~milob.processing.fitting.tikhonov_solve`) to every
+        frame. The stream must have ``status='od'`` and dims
+        (time, channel, wavelength).
+
+        Parameters
+        ----------
+        operator : SensitivityOperator or VoxelGrid
+            A :class:`~milob.forward.sensitivity.SensitivityOperator` whose
+            channel labels match this stream (use ``operator.for_probe(stream)``
+            to align them), or a bare ``VoxelGrid``, in which case ``mua0`` and
+            ``musp0`` are required and the matrices are built here.
+        mua0, musp0 : float, optional
+            Baseline absorption and reduced scattering in cm^-1. Taken from
+            the operator when one is given.
+        n : float
+            Refractive index. Default 1.4.
+        R_eff, greens_fn, phi0_source, phi0_measured
+            Passed to :func:`~milob.forward.jacobian.build_jacobian` when it is
+            the ``jacobian_fn``; ignored otherwise.
+        jacobian_fn : callable, optional
+            Builds the matrix for one wavelength, with the signature and return
+            dict of :func:`~milob.forward.jacobian.build_jacobian` (the
+            default). Not allowed together with a ``SensitivityOperator``.
+        jacobian_kwargs : dict, optional
+            Extra keyword arguments for ``jacobian_fn``.
+        alpha, lambda1, lambda2, method, channel_noise
+            Passed to :func:`~milob.processing.fitting.tikhonov_solve`.
+            ``lambda1=0.01, lambda2=0.1`` is a common choice.
+        channel_mask : array-like of bool, optional
+            Channels to use. Defaults to the operator's mask, or all channels.
+        inplace : bool
+            Ignored; a new stream is always returned.
+
+        Returns
+        -------
+        OptPropStream
+            Voxel-indexed, dims (time, voxel, wavelength, op) with
+            ``op=['mua']`` and ``status='delta_mua'``. ``uncertainty`` holds the
+            per-voxel variance and ``resolution_diag`` the resolution-matrix
+            diagonal per wavelength.
+
+        Raises
+        ------
+        ValueError
+            If the status is not 'od', the stream has extra dims, the
+            operator's channels differ from the stream's, both an operator and
+            a ``jacobian_fn`` are given, a bare grid lacks ``mua0``/``musp0``,
+            or an included channel contains NaN or inf.
+        """
+        if self.status != 'od':
+            raise ValueError("Data status is not 'od'. Ensure input is optical density.")
+
+        extra_dims = set(self.data.dims) - {'time', 'channel', 'wavelength'}
+        if extra_dims:
+            raise ValueError(
+                "CW_Stream.reconstruct() requires OD data with only "
+                f"(time, channel, wavelength) dims, got {self.data.dims} "
+                f"(unexpected: {extra_dims})."
+            )
+
+        from ..forward.jacobian import build_jacobian, si_greens_adapter
+        from ..forward.sensitivity import SensitivityOperator
+        from ..imaging import IMAGING_DTYPE
+        from ..processing.fitting import tikhonov_solve
+        from .opt_prop_stream import OptPropStream
+        import xarray as xr
+
+        op_obj = None
+        if isinstance(operator, SensitivityOperator):
+            op_obj = operator
+            voxel_grid = op_obj.voxel_grid
+            stream_labels = [str(c) for c in self.data.channel.values]
+            if stream_labels != op_obj.channel_labels:
+                raise ValueError(
+                    f"This operator's rows are {op_obj.n_channels} channels of a "
+                    f"different (or differently ordered) montage than the stream's "
+                    f"{len(stream_labels)}. Reconstructing would pair each "
+                    "measurement with the wrong voxel sensitivities. Realign "
+                    "first: `operator.for_probe(stream)`."
+                )
+            if jacobian_fn is not None:
+                raise ValueError(
+                    "Pass either a SensitivityOperator or a jacobian_fn, not "
+                    "both -- the operator already carries its matrices."
+                )
+            jacobian_fn = op_obj.as_jacobian_fn()
+            if mua0 is None:
+                mua0 = op_obj.baseline.get('mua0')
+            if musp0 is None:
+                musp0 = op_obj.baseline.get('musp0')
+            if channel_mask is None:
+                channel_mask = op_obj.channel_mask
+        else:
+            voxel_grid = operator
+            if mua0 is None or musp0 is None:
+                raise ValueError(
+                    "reconstruct() with a bare VoxelGrid needs an explicit "
+                    "homogeneous baseline (mua0, musp0 in cm^-1). Building a "
+                    "forward.sensitivity.SensitivityOperator instead carries "
+                    "the baseline with the Jacobians."
+                )
+
+        if jacobian_fn is None:
+            jacobian_fn = build_jacobian
+        extra = dict(jacobian_kwargs or {})
+        if jacobian_fn is build_jacobian:
+            extra.setdefault('greens_fn', greens_fn or si_greens_adapter)
+            extra.setdefault('R_eff', R_eff)
+            extra.setdefault('phi0_source', phi0_source)
+            extra.setdefault('phi0_measured', phi0_measured)
+
+        wavelength_vals = np.asarray(self.data.wavelength.values, dtype=float)
+        time_vals = self.data.time.values
+        n_time = len(time_vals)
+        n_wl = len(wavelength_vals)
+        n_voxels = voxel_grid.n_voxels
+
+        # Stored as IMAGING_DTYPE; tikhonov_solve works in float64.
+        delta_mua = np.full((n_time, n_voxels, n_wl), np.nan, dtype=IMAGING_DTYPE)
+        variance = np.full((n_time, n_voxels, n_wl), np.nan, dtype=IMAGING_DTYPE)
+        resolution = np.full((n_voxels, n_wl), np.nan, dtype=IMAGING_DTYPE)
+        alphas_used = {}
+
+        for wi, wl in enumerate(wavelength_vals):
+            jac = jacobian_fn(self.probe, voxel_grid, mua0=mua0, musp0=musp0, n=n,
+                               wavelength=float(wl), channel_mask=channel_mask, **extra)
+            J = jac['matrix']
+
+            y = self.data.sel(wavelength=wl, method='nearest') \
+                         .transpose('channel', 'time').values
+
+            # Excluded channels are zeroed (their rows of J are zero, so they
+            # cannot affect x); an included channel with NaN is an error.
+            row_mask = jac['channel_mask']
+            if row_mask is None:
+                row_mask = np.ones(y.shape[0], dtype=bool)
+            row_mask = np.asarray(row_mask, dtype=bool)
+            bad_rows = row_mask & ~np.isfinite(y).all(axis=1)
+            if bad_rows.any():
+                labels = np.asarray(jac['channel_labels'])[bad_rows]
+                raise ValueError(
+                    f"reconstruct(): {bad_rows.sum()} channel(s) included by "
+                    f"channel_mask contain NaN/inf at wavelength {wl:g}, which "
+                    f"would make the entire reconstructed image NaN. Offending "
+                    f"channels: {list(labels[:10])}"
+                    f"{' ...' if bad_rows.sum() > 10 else ''}. Either exclude them "
+                    f"via channel_mask, or drop them from the stream first "
+                    f"(e.g. drop_bad_channels()). Note regress_nuisance() returns "
+                    f"NaN for every channel it did not fit, short channels included."
+                )
+            y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+            x, unc, info = tikhonov_solve(J, y, alpha=alpha, lambda1=lambda1,
+                                           lambda2=lambda2, method=method,
+                                           channel_noise=channel_noise,
+                                           return_uncertainty=True)
+            delta_mua[:, :, wi] = x.T
+            variance[:, :, wi] = unc[np.newaxis, :]
+            resolution[:, wi] = info['resolution_diag']
+            alphas_used[float(wl)] = float(info['alpha'])
+
+        coords = {'time': time_vals, 'voxel': np.arange(n_voxels),
+                  'wavelength': wavelength_vals, 'op': ['mua']}
+        # Keep the source attrs (e.g. sampling_rate) and add the units.
+        recon_attrs = dict(self.data.attrs)
+        recon_attrs.update({'units': 'cm^-1', 'mua0': mua0, 'musp0': musp0})
+        data_da = xr.DataArray(delta_mua[..., np.newaxis], coords=coords,
+                                dims=['time', 'voxel', 'wavelength', 'op'],
+                                attrs=recon_attrs)
+        unc_da = xr.DataArray(
+            variance[..., np.newaxis], coords=coords,
+            dims=['time', 'voxel', 'wavelength', 'op'],
+            attrs={'description': 'per-voxel variance (diagonal approximation)'},
+        )
+        res_da = xr.DataArray(
+            resolution, coords={'voxel': np.arange(n_voxels), 'wavelength': wavelength_vals},
+            dims=['voxel', 'wavelength'],
+        )
+
+        record = {
+            'mua0': mua0, 'musp0': musp0, 'n': n, 'alpha': alpha,
+            'method': method, 'n_voxels': n_voxels,
+            'alpha_used_per_wavelength': alphas_used,
+            'lambda1': lambda1, 'lambda2': lambda2,
+        }
+        if op_obj is not None:
+            record.update(op_obj.history_entry())
+        else:
+            record['jacobian_fn'] = getattr(jacobian_fn, '__name__', 'custom')
+        history = self.history.copy()
+        history.append(self._history_entry('reconstruct', record))
+
+        return OptPropStream(
+            data=data_da, voxel_grid=voxel_grid, probe=self.probe,
+            uncertainty=unc_da, resolution_diag=res_da, name=self.name,
+            events=self.events, status='delta_mua', history=history,
+        )
+
     def regress_nuisance(self, nuisance_method='sc_pca',
-                          add_drift='intercept', n_components=0.8,
-                          method='robust', n_jobs=1):
+                          add_drift='intercept', drift_cutoff=0.01,
+                          n_components=0.8, method='robust', n_jobs=1):
         """
         Regress systemic noise and drift out of the data.
 
@@ -542,9 +902,13 @@ class CW_Stream(NirsStream):
             Source of the nuisance regressors. The 'sc_*' options build them from
             the short-separation channels, the 'global_*' options from all
             channels. Default 'sc_pca'.
-        add_drift : {'none', 'intercept', 'intercept+trend'}
+        add_drift : {'none', 'intercept', 'intercept+trend', 'dct'}
             Drift terms included alongside the nuisance regressors. Default
-            'intercept'.
+            'intercept'. 'dct' adds a discrete-cosine basis below
+            ``drift_cutoff``; the drift is removed from the output (only the
+            intercept is added back), so it also acts as a high-pass filter.
+        drift_cutoff : float
+            High-pass cutoff in Hz for ``add_drift='dct'``. Default 0.01.
         n_components : int or float
             Components kept for 'sc_pca' and 'global_pca'. An integer keeps that
             many; a float in (0, 1) keeps enough to explain that fraction of the
@@ -574,6 +938,7 @@ class CW_Stream(NirsStream):
         # 2. Create only nuisance regressors (No tasks)
         model.create_nuisance_regressors(
             add_drift=add_drift,
+            drift_cutoff=drift_cutoff,
             nuisance_method=nuisance_method,
             n_components=n_components
         )
@@ -599,6 +964,7 @@ class CW_Stream(NirsStream):
         history_params = {
             'nuisance_method': nuisance_method,
             'add_drift': add_drift,
+            'drift_cutoff': drift_cutoff if add_drift == 'dct' else None,
             'n_components': n_components,
             'method': method,
         }

@@ -120,8 +120,8 @@ class Datastream:
             if sc_threshold is None:
                 self.data.attrs['sc_threshold'] = None
             else:
-                length_unit = getattr(self.probe, 'lengthUnit', None) or 'mm'
-                self.data.attrs['sc_threshold'] = sc_threshold / 10 if length_unit == 'cm' else sc_threshold
+                # recorded in the probe's own unit, as the distances are
+                self.data.attrs['sc_threshold'] = sc_threshold / self.probe.mm_per_unit
             self.add_history('initialize_masks', {'sc_threshold': sc_threshold})
 
         if 'is_bad' not in self.data.coords:

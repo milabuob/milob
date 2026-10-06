@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.spatial.distance import cdist
 
+from .units import normalize_length_unit, mm_per_unit as _mm_per_unit
+
 
 class Probe:
     def __init__(self, s_pos, d_pos, wavelengths, *, sc_threshold,
@@ -36,8 +38,8 @@ class Probe:
             Names for the optodes.
         s_pos_2d, d_pos_2d : np.ndarray, optional
             Two-dimensional layout positions, for flat probe drawings.
-        lengthUnit : {'mm', 'cm'}, optional
-            Unit of the position arrays.
+        lengthUnit : {'mm', 'cm', 'm'}, optional
+            Unit of the position arrays, case-insensitive. None is read as mm.
 
         Examples
         --------
@@ -94,6 +96,27 @@ class Probe:
     def sc_threshold(self):
         """Distance in mm below which a channel counts as short. Read-only."""
         return self._sc_threshold
+
+    @property
+    def lengthUnit(self):
+        """
+        Unit of the optode coordinates: 'mm', 'cm', 'm', or None (read as mm).
+
+        Lower-cased on assignment. Any other unit raises ``ValueError``.
+        """
+        # Probes pickled before this was a property store it in __dict__.
+        if '_lengthUnit' in self.__dict__:
+            return self.__dict__['_lengthUnit']
+        return normalize_length_unit(self.__dict__.get('lengthUnit'))
+
+    @lengthUnit.setter
+    def lengthUnit(self, unit):
+        self._lengthUnit = normalize_length_unit(unit)
+
+    @property
+    def mm_per_unit(self):
+        """Millimetres per coordinate unit."""
+        return _mm_per_unit(self.lengthUnit, default='mm')
 
     @property
     def has_channels(self):
@@ -190,8 +213,7 @@ class Probe:
             else:
                 label_to_dist = dict(zip(self.channel_labels, self.distances))
                 dists = np.array([label_to_dist[ch] for ch in accepted])
-                if self.lengthUnit == 'cm':
-                    dists = dists * 10
+                dists = dists * self.mm_per_unit
                 n_short = int(np.sum(dists < self.sc_threshold))
                 n_long = len(accepted) - n_short
                 print(f"ROI '{name}': {len(accepted)} channel(s) — "
@@ -302,7 +324,7 @@ class Probe:
 
     def _channel_optode_positions_mm(self):
         """Return {channel label: (source position, detector position)} in mm."""
-        scale = 10.0 if self.lengthUnit == 'cm' else 1.0
+        scale = self.mm_per_unit
         s = np.asarray(self.s_pos, dtype=float) * scale
         d = np.asarray(self.d_pos, dtype=float) * scale
         return {
@@ -408,7 +430,7 @@ class Probe:
     @staticmethod
     def _scale_to_mm(probe):
         """Return the optode positions converted to mm."""
-        return 10.0 if probe.lengthUnit == 'cm' else 1.0
+        return probe.mm_per_unit
 
     @classmethod
     def union(cls, probes, *, position_tol=1.0):
@@ -770,9 +792,7 @@ class Probe:
         if threshold is None:
             return np.zeros(self.n_channels, dtype=bool)
 
-        distances = np.array(self.distances)
-        if self.lengthUnit == 'cm':  # transform to mm
-            distances = 10*distances
+        distances = np.array(self.distances, dtype=float) * self.mm_per_unit
 
         return distances < threshold
 
@@ -832,9 +852,7 @@ class Probe:
         if threshold is None:
             return []
 
-        distances = np.array(self.distances)
-        if self.lengthUnit == 'cm':  # transform to mm
-            distances = 10*distances
+        distances = np.array(self.distances, dtype=float) * self.mm_per_unit
 
         labels = np.array(self.channel_labels)
         mask = distances < threshold
@@ -862,9 +880,7 @@ class Probe:
         if threshold is None:
             return list(self.channel_labels)
 
-        distances = np.array(self.distances)
-        if self.lengthUnit == 'cm':  # transform to mm
-            distances = 10*distances
+        distances = np.array(self.distances, dtype=float) * self.mm_per_unit
 
         labels = np.array(self.channel_labels)
         mask = distances >= threshold

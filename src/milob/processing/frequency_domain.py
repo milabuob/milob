@@ -1,6 +1,7 @@
 import numpy as np
 import xarray as xr
 from typing import Optional, Union
+from ..core.units import cm_per_unit
 
 
 def fd_slopefitting(data: Union[np.ndarray, xr.DataArray],
@@ -48,8 +49,7 @@ def fd_slopefitting(data: Union[np.ndarray, xr.DataArray],
     if is_xarray:
         if distances is None:
             distances = data.coords['distance'].values
-            if data.attrs.get('lengthUnit') == 'mm':
-                distances = distances / 10.0
+            distances = distances * cm_per_unit(data.attrs.get('lengthUnit'), default='cm')
 
         if modulation_frequency is None:
             freqs = data.freq.values

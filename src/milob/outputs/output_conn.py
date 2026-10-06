@@ -317,7 +317,8 @@ class FCOutput(BaseOutput):
         Used to compare two matrices, for instance in subject identification.
         The geodesic metric is defined on symmetric positive-definite
         matrices, so it accepts a full correlation matrix over a session's
-        channels but not an inter-brain cross-block, which is not symmetric.
+        channels but not a cross-stream block from ``FC.fit(other=...)``,
+        which is not symmetric.
 
         Parameters
         ----------
@@ -436,8 +437,8 @@ class FCOutput(BaseOutput):
             # rather than leaving NaN.
             #
             # Only NaN diagonal entries are filled, never finite ones. On a
-            # matrix whose diagonal carries real data -- an inter-brain
-            # cross-block, where entry (i, i) is a genuine A_i-B_i
+            # matrix whose diagonal carries real data -- a cross-stream
+            # block, where entry (i, i) is a genuine A_i-B_i
             # correlation and not a self-loop -- an unconditional
             # fill_diagonal(1.0) would silently overwrite it, and since the
             # result has no NaNs left it would sail past the check below and

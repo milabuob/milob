@@ -7,6 +7,7 @@ from ..viz import timedomain as viz_timedomain
 import copy
 import numpy as np
 import xarray as xr
+from .units import cm_per_unit
 
 class TD_Stream(NirsStream):
     """
@@ -169,6 +170,37 @@ class TD_Stream(NirsStream):
         )
 
     # ------------------------------------------------------------------
+    # Differential pathlength factor
+    # ------------------------------------------------------------------
+
+    def calculate_dpf(self, n: float = 1.44, mode: str = 'static'):
+        """
+        Estimate the differential pathlength factor from the mean time of
+        flight, ``DPF = (c / n) * m1 / rho``.
+
+        Parameters
+        ----------
+        n : float
+            Refractive index of the medium. Default 1.44.
+        mode : {'static', 'timeseries'}
+            'static' averages over time and returns (channel, wavelength).
+            'timeseries' keeps the time axis when present.
+
+        Returns
+        -------
+        xarray.DataArray
+            DPF per channel and wavelength, with a leading time axis in
+            'timeseries' mode.
+
+        Raises
+        ------
+        ValueError
+            If the stream status is not 'raw' or 'moment', or ``mode`` is
+            unknown.
+        """
+        return time_domain.calculate_dpf_moments(self, n=n, mode=mode)
+
+    # ------------------------------------------------------------------
     # Optical property inversion
     # ------------------------------------------------------------------
 
@@ -267,8 +299,13 @@ class TD_Stream(NirsStream):
         observation : {'identity', 'convolve_irf'} or callable
             'identity' (default) for an already-deconvolved TPSF, or
             'convolve_irf' for a raw one, which requires ``irf``.
-        irf : array-like or callable, optional
+        irf : array-like, callable or 'emg', optional
             Instrument response, required when ``observation='convolve_irf'``.
+            'emg' uses the parametric response of
+            :func:`~milob.forward.observation.emg_irf_from_params`, whose
+            shape parameters ``irf_t0``, ``irf_sigma`` and ``irf_tau`` are
+            fitted when listed in ``param_config`` and returned on
+            ``obs_params``.
         n_starts : int, optional
             Number of multi-start attempts.
         random_state : int
@@ -303,20 +340,10 @@ class TD_Stream(NirsStream):
         if forward_model is None:
             forward_model = si_td_fluence_patterson
         if param_config is None:
-            # A's bounds are deliberately enormous (rather than a
-            # "reasonable-looking" tighter range): the forward models in
-            # forward.dos return an unnormalised "unit source" fluence
-            # whose absolute scale bears no fixed relationship to a real
-            # instrument's raw count scale (or to the arbitrary units this
-            # package's own simulate_*_td_stream happens to produce), so A
-            # has to be free to land anywhere from a small fraction to many
-            # orders of magnitude above 1 -- verified directly: a
-            # noiseless synthetic fit needed A ~ 1e-22 to match
-            # simulate_si_td_stream's own gated-count convention, far
-            # outside a naively "sensible" (1e-3, 1e12) range, which
-            # instead pinned mua/musp/A all at their bounds with a
-            # confidently wrong answer. Narrow this only once you know your
-            # own data/instrument's actual count scale.
+            # A scales a unit-source fluence rate to the units of the data,
+            # so its bounds are wide. For simulate_*_td_stream data A equals
+            # the gate width; measured counts can be many orders of magnitude
+            # higher. Narrow the range once the instrument's scale is known.
             param_config = {
                 "mua": {"bounds": (1e-3, 0.5), "log": True},
                 "musp": {"bounds": (1.0, 30.0), "log": True},
@@ -329,8 +356,7 @@ class TD_Stream(NirsStream):
 
         if distances is None:
             distances = self.data.coords['distance'].values
-            if self.data.attrs.get('lengthUnit') == 'mm':
-                distances = distances / 10.0
+            distances = distances * cm_per_unit(self.data.attrs.get('lengthUnit'), default='cm')
         distances = np.asarray(distances, dtype=float)
 
         data_arr = self.data.values  # (time, channel, wavelength, bin)
@@ -522,8 +548,7 @@ class TD_Stream(NirsStream):
 
         if distances is None:
             distances = self.data.coords['distance'].values
-            if self.data.attrs.get('lengthUnit') == 'mm':
-                distances = distances / 10.0
+            distances = distances * cm_per_unit(self.data.attrs.get('lengthUnit'), default='cm')
         distances = np.asarray(distances, dtype=float)
 
         m0_arr = self.data.sel(moment='m0').values

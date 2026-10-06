@@ -1,5 +1,7 @@
 import numpy as np
 
+from ..core.units import mm_per_unit
+
 # Standard fiducial positions on the MNI152 (fsaverage) template, in mm (RAS).
 # From MNE-Python fsaverage-fiducials, converted from metres.
 MNI152_LANDMARKS = {
@@ -213,7 +215,7 @@ class Coregistration:
         The fit is rigid and the reference landmarks are in mm, so a probe built
         in other units must be scaled before it is fitted or transformed.
         """
-        return 10.0 if getattr(self.probe, 'lengthUnit', None) == 'cm' else 1.0
+        return mm_per_unit(getattr(self.probe, 'lengthUnit', None), default='mm')
 
     def _to_mm(self, points) -> np.ndarray:
         """Convert probe-space points from the probe's own unit to mm."""

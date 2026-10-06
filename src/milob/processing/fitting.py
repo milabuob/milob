@@ -2,6 +2,7 @@ import inspect
 from typing import NamedTuple
 
 import numpy as np
+import scipy.linalg
 import scipy.optimize
 from scipy.stats import qmc
 import xarray as xr
@@ -68,12 +69,28 @@ def default_n_starts(n_params, floor=8, per_param=4):
 
 
 def _resolve_sigma(sigma, n):
-    """Normalise sigma to None or an array matching the transformed residual."""
+    """
+    Normalise sigma to None, a length-``n`` array, or an (n, n) covariance
+    matrix of the transformed residual.
+    """
     if sigma is None:
         return None
     sigma = np.asarray(sigma, dtype=float)
     if sigma.ndim == 0:
         return np.full(n, float(sigma))
+    if sigma.ndim == 2:
+        if sigma.shape != (n, n):
+            raise ValueError(
+                f"sigma is a {sigma.shape} covariance matrix, but the "
+                f"(transformed) residual has length {n} -- expected ({n}, {n})."
+            )
+        if not np.allclose(sigma, sigma.T):
+            raise ValueError("sigma covariance matrix must be symmetric.")
+        try:
+            np.linalg.cholesky(sigma)
+        except np.linalg.LinAlgError:
+            raise ValueError("sigma covariance matrix must be positive definite.") from None
+        return sigma
     if sigma.shape != (n,):
         raise ValueError(
             f"sigma has shape {sigma.shape}, but the (transformed) residual "
@@ -81,6 +98,19 @@ def _resolve_sigma(sigma, n):
             f"transformed residual, not the raw measurement."
         )
     return sigma
+
+
+def _whiten(resid, sigma, chol=None):
+    """
+    Divide a residual by its noise: ``r / sigma`` for a 1-D ``sigma``, or
+    ``L^-1 r`` for a covariance ``C = L L^T`` whose Cholesky factor is
+    ``chol``.
+    """
+    if sigma is None:
+        return resid
+    if chol is not None:
+        return scipy.linalg.solve_triangular(chol, resid, lower=True)
+    return resid / sigma
 
 
 def _multistart_optimize(fit_func, xdata, ydata, starts, bounds, n_jobs=1, context="",
@@ -94,11 +124,13 @@ def _multistart_optimize(fit_func, xdata, ydata, starts, bounds, n_jobs=1, conte
             )
         except RuntimeError:
             return None
-        resid = fit_func(xdata, *popt) - ydata
-        if sigma is not None:
-            resid = resid / sigma
+        resid = _whiten(fit_func(xdata, *popt) - ydata, sigma, chol)
         cost = np.sum(resid ** 2)
         return (cost, popt, pcov)
+
+    # A 2-D sigma is a residual covariance: rank starts by r^T C^-1 r, the
+    # quantity curve_fit minimises.
+    chol = np.linalg.cholesky(sigma) if sigma is not None and np.ndim(sigma) == 2 else None
 
     jobs = [(_try, (p0,)) for p0 in starts]
     raw = run_parallel_fits(jobs, n_jobs=n_jobs)
@@ -170,6 +202,10 @@ def _multistart_optimize(fit_func, xdata, ydata, starts, bounds, n_jobs=1, conte
 
 def _resolve_td_irf(irf, t, flat):
     """Resolve the instrument response to an array on the fitting time grid."""
+    if isinstance(irf, str):
+        if irf != "emg":
+            raise ValueError(f"Unknown irf '{irf}'; use 'emg', an array, or a callable.")
+        return np.asarray(_observation.emg_irf_from_params(t, flat), dtype=float)
     if callable(irf):
         return np.asarray(irf(t, flat), dtype=float)
     return np.asarray(irf, dtype=float)
@@ -222,8 +258,14 @@ def td_model_opt(
     observation : {'identity', 'convolve_irf'}
         Whether the model output is compared directly with the data or first
         convolved with the instrument response.
-    irf : array-like or callable, optional
-        Instrument response, required when convolving.
+    irf : array-like, callable or 'emg', optional
+        Instrument response, required when convolving: a measured array on
+        the grid ``t``, a callable ``(t, flat) -> irf_t``, or 'emg' for
+        :func:`~milob.forward.observation.emg_irf_from_params`, whose shape
+        parameters ``irf_t0``, ``irf_sigma`` and ``irf_tau`` go in
+        ``param_config`` or ``fixed_params``. Fitted parameters of a custom
+        callable are stored as observation parameters only if listed in
+        ``OBSERVATION_PARAMS``.
     n_starts : int, optional
         Number of optimiser runs from different starting points, keeping the
         best. The first start is the bounds' midpoint and the rest form a
@@ -593,6 +635,102 @@ def _resolve_fd_residual_transform(transform):
         )
 
 
+def _per_channel(value, n_ch, what):
+    """Broadcast a scalar to one value per channel, or check its length."""
+    value = np.asarray(value, dtype=float)
+    if value.ndim == 0:
+        return np.full(n_ch, float(value))
+    if value.shape != (n_ch,):
+        raise ValueError(f"{what} has shape {value.shape}; expected a scalar "
+                         f"or one value per channel ({n_ch},).")
+    return value
+
+
+def _channel_sigma_per_block(channel_sigma, blocks, multi_block):
+    """
+    Split ``channel_sigma`` into one entry per block. A list counts as
+    per-block only in a multi-block fit when its length equals the number of
+    blocks; a list of scalars that also matches every block's channel count
+    is ambiguous and rejected.
+    """
+    n_blocks = len(blocks)
+    if multi_block and isinstance(channel_sigma, list) and len(channel_sigma) == n_blocks:
+        all_scalar = all(np.ndim(c) == 0 and not isinstance(c, tuple) for c in channel_sigma)
+        n_ch = {len(rho_i) for rho_i, _, _ in blocks}
+        if all_scalar and n_ch == {n_blocks}:
+            raise ValueError(
+                f"channel_sigma={channel_sigma!r} is ambiguous: {n_blocks} entries "
+                f"match both the number of blocks and the number of channels. Pass "
+                f"np.array(...) for one value per channel, or a list of per-block "
+                f"tuples/arrays."
+            )
+        return list(channel_sigma)
+    return [channel_sigma] * n_blocks
+
+
+def fd_residual_covariance(rho, channel_sigma, residual_transform="reference_channel",
+                           **residual_kwargs):
+    """
+    Covariance of an FD-DOS residual transform, propagated from per-channel
+    noise.
+
+    The residual transforms compare channels with each other, so their
+    outputs are correlated even when each channel's noise is independent.
+    With ``y = (ln A_1..ln A_n, phi_1..phi_n)`` and ``T`` the Jacobian of the
+    transform with respect to ``y``, the covariance is
+    ``T diag(sigma_y^2) T^T``. ``T`` is computed numerically and is exact for
+    transforms linear in ln A and phase, which both built-in transforms are.
+
+    Parameters
+    ----------
+    rho : array-like
+        Source-detector distances, one per channel.
+    channel_sigma : float, array-like or (amp_sigma, phase_sigma)
+        Noise on each channel. A single value, scalar or per channel, is used
+        for both the relative amplitude noise (std of ln A) and the phase
+        noise in radians. A 2-tuple sets them separately.
+    residual_transform : str or callable
+        As in :func:`fd_model_opt`.
+    **residual_kwargs
+        Forwarded to the transform, e.g. ``ref_idx``.
+
+    Returns
+    -------
+    np.ndarray
+        Covariance matrix, shape (n_residual, n_residual).
+
+    Raises
+    ------
+    ValueError
+        If a tuple ``channel_sigma`` does not have two entries, or a
+        per-channel array does not match ``rho``.
+    """
+    rho = np.asarray(rho, dtype=float)
+    n_ch = len(rho)
+    if isinstance(channel_sigma, tuple):
+        if len(channel_sigma) != 2:
+            raise ValueError("channel_sigma as a tuple must be (amp_sigma, phase_sigma).")
+        amp_sigma, phase_sigma = channel_sigma
+    else:
+        amp_sigma = phase_sigma = channel_sigma
+    var_y = np.concatenate([_per_channel(amp_sigma, n_ch, "amp_sigma"),
+                            _per_channel(phase_sigma, n_ch, "phase_sigma")]) ** 2
+
+    transform = _resolve_fd_residual_transform(residual_transform)
+
+    def f(y):
+        return np.asarray(transform(np.exp(y[:n_ch]), y[n_ch:], rho, **residual_kwargs),
+                          dtype=float)
+
+    # Central differences about a neutral point (unit amplitude, zero
+    # phase); exact for transforms linear in (ln A, phi).
+    y0 = np.zeros(2 * n_ch)
+    h = 1e-6
+    T = np.column_stack([(f(y0 + h * e) - f(y0 - h * e)) / (2 * h)
+                         for e in np.eye(2 * n_ch)])
+    return (T * var_y) @ T.T
+
+
 def _unit_interval_from(x, cfg):
     """Map a parameter onto the unit interval given its bounds."""
     lo, hi = cfg["bounds"]
@@ -642,6 +780,7 @@ def fd_model_opt(
     sigma=None,
     absolute_sigma=False,
     return_covariance=False,
+    channel_sigma=None,
     **residual_kwargs,
 ):
     """
@@ -690,14 +829,23 @@ def fd_model_opt(
     n_jobs : int
         Parallel jobs across the starts. Default 1, meaning serial.
     sigma : float or array-like, optional
-        Known per-point noise on the transformed residual. If None, the
+        Known per-point noise on the transformed residual, or its full
+        covariance as a 2-D array. If None, the
         reported covariance is self-calibrated from the fit's own residual,
         which makes a noiseless synthetic fit report a near-zero uncertainty.
     absolute_sigma : bool
-        Treat ``sigma`` as a known absolute noise level, anchoring the
-        covariance to it. Default False, matching ``curve_fit``.
+        Treat ``sigma`` or ``channel_sigma`` as a known absolute noise level,
+        anchoring the covariance to it. Default False, matching
+        ``curve_fit``.
     return_covariance : bool
         Also return the full parameter covariance matrix. Default False.
+    channel_sigma : float, array-like, (amp_sigma, phase_sigma) or list, optional
+        Known noise on each measured channel: relative amplitude noise (std
+        of ln A) and phase noise in radians, a single value being used for
+        both. It is propagated into the full residual covariance with
+        :func:`fd_residual_covariance`. In a multi-block fit one value is
+        shared by every block; a list with one entry per block sets them
+        separately. Mutually exclusive with ``sigma``.
     **residual_kwargs
         Forwarded to the residual transform, e.g. ``ref_idx``.
 
@@ -715,6 +863,9 @@ def fd_model_opt(
     Martins, G. G., Forti, R. M., & Mesquita, R. C. (2025). Spectroscopy
     Journal, 3, 14.
     """
+    if sigma is not None and channel_sigma is not None:
+        raise ValueError("Pass either sigma (noise on the transformed residual) or "
+                         "channel_sigma (noise per measured channel), not both.")
     if fixed_params is None:
         fixed_params = {}
 
@@ -774,6 +925,14 @@ def fd_model_opt(
     # only used its `rho` parameter for the transform's channel count, not
     # curve_fit's own bookkeeping.
     xdata = np.arange(len(ydata))
+
+    if channel_sigma is not None:
+        per_block = _channel_sigma_per_block(channel_sigma, blocks, multi_block)
+        # Blocks (e.g. wavelengths) have independent noise: block-diagonal.
+        sigma = scipy.linalg.block_diag(*[
+            fd_residual_covariance(rho_i, cs, residual_transform, **residual_kwargs)
+            for (rho_i, _, _), cs in zip(blocks, per_block)
+        ])
 
     resolved_n_starts = default_n_starts(n_params) if n_starts is None else n_starts
 
@@ -1023,6 +1182,132 @@ def dcs_g1_model_opt(
 
 
 # =======================================================================
+# Regularised linear inverse (image reconstruction)
+# =======================================================================
+
+def tikhonov_solve(J, y, *, alpha=None, lambda1=None, lambda2=None,
+                    method="svd", channel_noise=None, return_uncertainty=True):
+    """
+    Solve ``y ~= J @ x`` with Tikhonov regularisation.
+
+    Uses the minimum-norm form ``x = R @ y`` with
+    ``R = J.T @ inv(J @ J.T + alpha * I)``, computed once from an SVD of
+    ``J`` and applied to every column of ``y``.
+
+    Parameters
+    ----------
+    J : np.ndarray, shape (n_channels, n_voxels)
+        Sensitivity matrix, e.g. from
+        :func:`~milob.forward.jacobian.build_jacobian`.
+    y : np.ndarray, shape (n_channels,) or (n_channels, n_frames)
+        Measurement changes, e.g. Delta_OD, one frame per column.
+    alpha : float, optional
+        Absolute regularisation weight. Mutually exclusive with ``lambda1``.
+    lambda1 : float, optional
+        Relative regularisation weight, ``alpha = (lambda1 * s_max)**2`` with
+        ``s_max`` the largest singular value of ``J`` (NeuroDOT convention).
+        Default 0.01 when ``alpha`` is not given.
+    lambda2 : float, optional
+        Spatially variant regularisation (NeuroDOT convention). Columns are
+        scaled by ``g_j = 1 / sqrt(||J_j||^2 + lambda2 * max_k ||J_k||^2)``
+        before the solve, and the solution is scaled back. None disables it;
+        0.1 is a common value.
+    method : {"svd"}
+        Solver. Only "svd" is available.
+    channel_noise : array-like, shape (n_channels,), optional
+        Noise standard deviation per channel, in the units of ``y``. If
+        given, ``J`` and ``y`` are whitened first and ``uncertainty`` is in
+        absolute units; otherwise unit noise is assumed.
+    return_uncertainty : bool
+        Compute ``uncertainty`` and the resolution diagonal. Default True.
+
+    Returns
+    -------
+    x : np.ndarray, shape (n_voxels,) or (n_voxels, n_frames)
+        Reconstructed perturbation.
+    uncertainty : np.ndarray, shape (n_voxels,) or None
+        Per-voxel variance ``diag(R @ R.T)``, ignoring correlations between
+        voxels. None when ``return_uncertainty`` is False.
+    info : dict
+        ``alpha``, ``lambda1`` and ``lambda2`` used, the operator ``R``,
+        ``column_weights`` (the ``g_j``, or None) and ``resolution_diag``
+        (``diag(R @ J)`` against the unweighted ``J``, or None).
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not "svd", both ``alpha`` and ``lambda1`` are given,
+        ``lambda2`` is not positive, or ``J`` is all zeros with ``lambda2``.
+
+    References
+    ----------
+    Eggebrecht, A. T., et al. (2014). Mapping distributed brain function and
+    networks with diffuse optical tomography. Nature Photonics, 8, 448-454.
+    """
+    if method != "svd":
+        raise ValueError(f"tikhonov_solve only implements method='svd', got {method!r}.")
+    if alpha is not None and lambda1 is not None:
+        raise ValueError(
+            "Pass either alpha (absolute) or lambda1 (relative), not both: "
+            "alpha = (lambda1 * s_max)**2 is the same weight twice over."
+        )
+    if alpha is None and lambda1 is None:
+        lambda1 = 0.01
+
+    J = np.asarray(J, dtype=float)
+    y = np.asarray(y, dtype=float)
+    scalar_y = y.ndim == 1
+    if scalar_y:
+        y = y[:, np.newaxis]
+
+    if channel_noise is not None:
+        w = 1.0 / np.asarray(channel_noise, dtype=float)
+        J = J * w[:, np.newaxis]
+        y = y * w[:, np.newaxis]
+
+    # J_solve is inverted; J stays the forward operator for resolution_diag.
+    g = None
+    J_solve = J
+    if lambda2 is not None:
+        lambda2 = float(lambda2)
+        if lambda2 <= 0:
+            raise ValueError("lambda2 must be > 0; pass None to disable weighting.")
+        col_sq = np.sum(J ** 2, axis=0)
+        col_max = col_sq.max()
+        if not np.isfinite(col_max) or col_max <= 0:
+            raise ValueError(
+                "lambda2 needs a J with at least one non-zero column; "
+                "this one is all zeros (every channel masked out?)."
+            )
+        g = 1.0 / np.sqrt(col_sq + lambda2 * col_max)
+        J_solve = J * g
+
+    U, S, Vt = np.linalg.svd(J_solve, full_matrices=False)
+
+    if alpha is None:
+        alpha = (float(lambda1) * S[0]) ** 2
+
+    filt = S / (S ** 2 + alpha)
+    R = (Vt.T * filt) @ U.T
+    if g is not None:
+        R = R * g[:, np.newaxis]
+
+    x = R @ y
+    if scalar_y:
+        x = x[:, 0]
+
+    info = {'alpha': alpha, 'R': R, 'resolution_diag': None,
+            'lambda2': lambda2, 'column_weights': g,
+            'lambda1': (float(np.sqrt(alpha)) / S[0]) if S[0] > 0 else None}
+    uncertainty = None
+    if return_uncertainty:
+        uncertainty = np.sum(R ** 2, axis=1)
+        info['resolution_diag'] = np.einsum('jk,kj->j', R, J)
+
+    return x, uncertainty, info
+
+
+# =======================================================================
 # Joint multi-modality fitting
 # =======================================================================
 #
@@ -1073,8 +1358,9 @@ class ResidualBlock:
     data : array-like
         The measured vector, transformed the same way.
     sigma : float or array-like
-        Measurement noise on ``data``, in the same units. Required, since
-        least squares otherwise weights blocks by point count and units.
+        Measurement noise on ``data``, in the same units, or its covariance
+        as a 2-D array. Required, since least squares otherwise weights
+        blocks by point count and units.
     forward_parameters : dict, optional
         Fixed context merged in before ``model_fn`` is called.
     name : str
@@ -1096,6 +1382,7 @@ class ResidualBlock:
                 f"See joint_model_opt's Notes."
             )
         self.sigma = _resolve_sigma(sigma, len(self.data))
+        self._chol = np.linalg.cholesky(self.sigma) if self.sigma.ndim == 2 else None
 
     @property
     def n_points(self):
@@ -1113,10 +1400,11 @@ class ResidualBlock:
         Returns
         -------
         np.ndarray
-            Residual divided by ``sigma``.
+            Residual divided by ``sigma``, or whitened by its covariance.
         """
         merged = {**self.forward_parameters, **flat}
-        return (np.asarray(self.model_fn(merged), dtype=float) - self.data) / self.sigma
+        return _whiten(np.asarray(self.model_fn(merged), dtype=float) - self.data,
+                       self.sigma, self._chol)
 
 
 def _accepted_kwargs(forward_model):
@@ -1128,9 +1416,9 @@ def _accepted_kwargs(forward_model):
     }
 
 
-def fd_block(rho, data, forward_model, forward_parameters, *, sigma,
+def fd_block(rho, data, forward_model, forward_parameters, *, sigma=None,
              assemble=None, residual_transform="reference_channel",
-             name="fd", **residual_kwargs):
+             name="fd", channel_sigma=None, **residual_kwargs):
     """
     Build an FD-DOS block for :func:`joint_model_opt`.
 
@@ -1144,20 +1432,35 @@ def fd_block(rho, data, forward_model, forward_parameters, *, sigma,
         Model evaluated per distance.
     forward_parameters : dict, optional
         Fixed context passed to ``forward_model``.
-    sigma : float or array-like
-        Noise on the transformed residual, not on the raw complex fluence.
+    sigma : float or array-like, optional
+        Noise on the transformed residual, not on the raw complex fluence, or
+        its covariance as a 2-D array.
     assemble : callable, optional
         Maps the merged flat parameter dict onto the model's arguments.
     residual_transform : str or callable
         Applied identically to model and data.
     name : str, optional
         Label used in error messages.
+    channel_sigma : float, array-like or (amp_sigma, phase_sigma), optional
+        Noise on each measured channel, propagated into the residual
+        covariance with :func:`fd_residual_covariance`. Exactly one of
+        ``sigma`` and ``channel_sigma`` is required.
 
     Returns
     -------
     ResidualBlock
+
+    Raises
+    ------
+    ValueError
+        If both ``sigma`` and ``channel_sigma`` are given, or neither.
     """
+    if sigma is not None and channel_sigma is not None:
+        raise ValueError(f"Block '{name}': pass either sigma or channel_sigma, not both.")
     rho = np.asarray(rho, dtype=float)
+    if channel_sigma is not None:
+        sigma = fd_residual_covariance(rho, channel_sigma, residual_transform,
+                                       **residual_kwargs)
     transform = _resolve_fd_residual_transform(residual_transform)
     data = np.asarray(data)
     ydata = transform(np.abs(data), np.angle(data), rho, **residual_kwargs)

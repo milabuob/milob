@@ -194,9 +194,7 @@ class NirsStream(MeasurementStream):
         target = self if inplace else self.copy()
         
         # Get distances in mm
-        distances = np.array(self.probe.distances)
-        if getattr(self.probe, "lengthUnit", "mm") == "cm":
-            distances *= 10
+        distances = np.array(self.probe.distances, dtype=float) * self.probe.mm_per_unit
 
         channels = self.data.channel.values
         is_bad = self.data.coords["is_bad"].values.copy()
@@ -263,9 +261,7 @@ class NirsStream(MeasurementStream):
         fs = self.data.attrs.get('sampling_rate', 10.0)
 
         # Channel -> SD distance (mm) lookup, for display in the plot title
-        distances_mm = np.array(self.probe.distances, dtype=float)
-        if getattr(self.probe, "lengthUnit", "mm") == "cm":
-            distances_mm = distances_mm * 10
+        distances_mm = np.array(self.probe.distances, dtype=float) * self.probe.mm_per_unit
         distance_lookup = dict(zip(self.probe.channel_labels, distances_mm))
 
         all_channels = list(self.data.channel.values)

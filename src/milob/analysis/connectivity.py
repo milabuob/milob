@@ -1410,9 +1410,8 @@ class FC(BaseAnalysis):
         is_short_b = data_b.coords.get('is_short', np.zeros(n_chans_b, dtype=bool))
         valid_b = np.where(~(is_bad_b | is_short_b))[0]
 
-        # One combined (time, channel, type) array so the cross compute_fn
-        # sees the same layout the intra-brain path does -- group_a/group_b
-        # are positions within it, not each stream's own local indices.
+        # One combined (time, channel, type) array, as in the single-stream
+        # path; group_a/group_b are positions within it.
         combined = np.concatenate([values_a, values_b], axis=1)
         group_a = valid_a
         group_b = valid_b + n_chans_a
@@ -1680,10 +1679,7 @@ class FC(BaseAnalysis):
         )
 
         from .. import __version__
-        # Both operands' provenance, not just this stream's: a cross-only
-        # fit is a genuine two-input operation, and (unlike the intra-brain
-        # path) `other`'s history isn't guaranteed to surface anywhere else
-        # if this FCOutput is used standalone, so record both here.
+        # Record the history of both input streams.
         history = list(self.dataset.history) + list(other_history) + [{
             'operation': 'FC.fit', 'params': config, 'version': __version__
         }]

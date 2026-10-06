@@ -11,6 +11,7 @@ import numpy as np
 import xarray as xr
 
 from . import kernels
+from ._geometry import probe_distances_cm
 from . import dispersion
 from . import dynamics
 from . import noise_models
@@ -392,7 +393,7 @@ def _apply_tau_dependent_noise(data, taus, beta, rng, noise_params):
     Parameters
     ----------
     data : np.ndarray
-        Shape (1, n_channels, 1, n_taus), the clean g2 curves.
+        Shape (n_times, n_channels, 1, n_taus), the clean g2 curves.
     taus : np.ndarray
         Correlation delays in seconds.
     beta : float
@@ -436,15 +437,16 @@ def _apply_tau_dependent_noise(data, taus, beta, rng, noise_params):
         )
     other_params = {k: v for k, v in noise_params.items() if k != 'intensity'}
 
-    for ci in range(n_ch):
-        noisy[0, ci, 0, :] = noise_models.zhou_noise_model(
-            data[0, ci, 0, :], taus, rng=rng, beta=beta,
-            intensity=intensity[ci], **other_params
-        )
+    for ti in range(data.shape[0]):
+        for ci in range(n_ch):
+            noisy[ti, ci, 0, :] = noise_models.zhou_noise_model(
+                data[ti, ci, 0, :], taus, rng=rng, beta=beta,
+                intensity=intensity[ci], **other_params
+            )
     return noisy
 
 
-def _simulated_stream_coords(probe, taus, wavelength, distances):
+def _simulated_stream_coords(probe, taus, wavelength, distances, time=None):
     """
     Build the coordinate dict shared by the DCS simulators.
 
@@ -462,6 +464,8 @@ def _simulated_stream_coords(probe, taus, wavelength, distances):
         Wavelength in nm.
     distances : array-like
         Source-detector distances.
+    time : array-like, optional
+        Time coordinate. Defaults to a single sample at 0.
 
     Returns
     -------
@@ -469,7 +473,7 @@ def _simulated_stream_coords(probe, taus, wavelength, distances):
         Coordinates for the simulated stream.
     """
     coords = {
-        'time': [0.0],
+        'time': [0.0] if time is None else time,
         'channel': probe.channel_labels,
         'wavelength': [wavelength],
         'tau': taus,
@@ -485,17 +489,18 @@ def _simulated_stream_coords(probe, taus, wavelength, distances):
 def simulate_dcs_stream(probe, mua, musp, taus, wavelength=None, n=1.33, z=0.0,
                          aDb=None, alpha=None, Db=None, beta=1.0, motion="brownian",
                          noise_level=None, rng=None, noise_type='gaussian', noise_params=None,
-                         **motion_params):
+                         fs=1.0, **motion_params):
     """
     Simulate a CW-DCS dataset for a semi-infinite homogeneous medium.
 
     Parameters
     ----------
     probe : Probe
-        Must carry a channel configuration, with distances in cm.
-    mua, musp : float
-        Absorption and reduced scattering in cm^-1, shared across the probe's
-        wavelengths. Pass arrays if they vary by wavelength.
+        Must carry a channel configuration. Distances are converted to cm
+        from ``probe.lengthUnit``; a probe without a unit is read as cm.
+    mua, musp : float or array-like
+        Absorption and reduced scattering in cm^-1 at the DCS wavelength. A
+        1-D array gives one value per time point; scalars are held constant.
     taus : array-like
         Correlation delays in seconds.
     wavelength : float, optional
@@ -504,9 +509,9 @@ def simulate_dcs_stream(probe, mua, musp, taus, wavelength=None, n=1.33, z=0.0,
         Refractive index. Default 1.33.
     z : float
         Detector depth in cm, with 0 the boundary.
-    aDb : float, optional
-        The bundled flow index in cm^2/s. Mutually exclusive with ``alpha``
-        and ``Db``.
+    aDb : float or array-like, optional
+        The bundled flow index in cm^2/s, scalar or one value per time
+        point. Mutually exclusive with ``alpha`` and ``Db``.
     alpha, Db : float, optional
         Moving-scatterer fraction and diffusion coefficient, recorded
         separately in the history even though only their product is
@@ -515,9 +520,10 @@ def simulate_dcs_stream(probe, mua, musp, taus, wavelength=None, n=1.33, z=0.0,
         Coherence factor of the Siegert relation.
     motion : str
         Scatterer-motion submodel.
-    noise_level : float, optional
-        Proportional Gaussian noise on g2, as a fraction of the mean. Used
-        only when ``noise_type`` is 'gaussian'. None adds none.
+    noise_level : float or array-like, optional
+        Proportional Gaussian noise on g2, as a fraction of the mean: one
+        value, or one per channel. Used only when ``noise_type`` is
+        'gaussian'. None adds none.
     rng : int or numpy.random.Generator, optional
         Seed or generator for reproducible noise.
     noise_type : {'gaussian', 'tau_dependent'}
@@ -526,11 +532,20 @@ def simulate_dcs_stream(probe, mua, musp, taus, wavelength=None, n=1.33, z=0.0,
     noise_params : dict, optional
         Settings for the photon-counting model: integration time, and a
         photon count rate that may be scalar or one value per channel.
+    fs : float
+        Sampling rate in Hz, setting the time coordinate. Default 1.0.
 
     Returns
     -------
     DCS_Stream
-        Shape (1, n_channels, n_wavelengths, n_taus), holding g2.
+        Shape (n_times, n_channels, 1, n_taus), holding g2. ``n_times`` is 1
+        unless ``mua``, ``musp`` or the flow is given per time point.
+
+    Raises
+    ------
+    ValueError
+        If the flow is not given exactly once, the time-resolved inputs have
+        different lengths, or ``noise_level`` does not match the channels.
     """
     from ..core.dcs_stream import DCS_Stream
 
@@ -546,21 +561,40 @@ def simulate_dcs_stream(probe, mua, musp, taus, wavelength=None, n=1.33, z=0.0,
     if wavelength is None:
         wavelength = float(probe.wavelengths[0])
 
-    distances = np.array(probe.distances, dtype=float)
+    distances = probe_distances_cm(probe, untagged='cm')
     n_ch = len(distances)
     taus = np.asarray(taus, dtype=float)
     n_tau = len(taus)
 
-    g1 = si_dcs_g1(distances, mua, musp, n, wavelength, taus, aDb, z=z,
-                    motion=motion, **motion_params)
-    g2 = 1.0 + beta * np.abs(g1) ** 2
+    try:
+        mua_t, musp_t, aDb_t = np.broadcast_arrays(
+            np.atleast_1d(np.asarray(mua, dtype=float)),
+            np.atleast_1d(np.asarray(musp, dtype=float)),
+            np.atleast_1d(np.asarray(aDb, dtype=float)))
+    except ValueError:
+        raise ValueError("mua, musp and the flow must be scalars or 1-D arrays of the "
+                         "same length (one value per time point).") from None
+    if mua_t.ndim != 1:
+        raise ValueError("mua, musp and the flow must be scalars or 1-D arrays "
+                         "(one value per time point).")
+    n_time = len(mua_t)
 
-    data = g2.reshape(1, n_ch, 1, n_tau)
+    data = np.empty((n_time, n_ch, 1, n_tau))
+    for ti in range(n_time):
+        g1 = si_dcs_g1(distances, mua_t[ti], musp_t[ti], n, wavelength, taus, aDb_t[ti],
+                       z=z, motion=motion, **motion_params)
+        data[ti, :, 0, :] = (1.0 + beta * np.abs(g1) ** 2).reshape(n_ch, n_tau)
 
     if noise_type == 'gaussian':
         if noise_level is not None:
+            level = np.asarray(noise_level, dtype=float)
+            if level.ndim == 1:
+                if level.shape != (n_ch,):
+                    raise ValueError(f"noise_level has {level.size} entries; expected a "
+                                     f"scalar or one per channel ({n_ch}).")
+                level = level.reshape(1, n_ch, 1, 1)
             rng = np.random.default_rng(rng)
-            data = data + rng.standard_normal(data.shape) * data * noise_level
+            data = data + rng.standard_normal(data.shape) * data * level
     elif noise_type == 'tau_dependent':
         data = _apply_tau_dependent_noise(data, taus, beta, rng, noise_params)
     else:
@@ -569,14 +603,22 @@ def simulate_dcs_stream(probe, mua, musp, taus, wavelength=None, n=1.33, z=0.0,
     data_xr = xr.DataArray(
         data,
         dims=['time', 'channel', 'wavelength', 'tau'],
-        coords=_simulated_stream_coords(probe, taus, wavelength, distances),
-        attrs={'status': 'raw', 'lengthUnit': 'cm', 'observation': 'g2'},
+        coords=_simulated_stream_coords(probe, taus, wavelength, distances,
+                                        time=np.arange(n_time) / float(fs)),
+        attrs={'status': 'raw', 'lengthUnit': 'cm', 'observation': 'g2',
+               'sampling_rate': float(fs)},
     )
 
     stream = DCS_Stream(data=data_xr, probe=probe, name='simulated_dcs', status='raw')
 
-    history_params = {'mua': mua, 'musp': musp, 'n': n, 'z': z, 'beta': beta,
-                       'motion': motion, 'aDb': aDb, **motion_params}
+    def _plain(v):
+        v = np.asarray(v, dtype=float)
+        return float(v) if v.ndim == 0 else v.tolist()
+
+    history_params = {'mua': _plain(mua), 'musp': _plain(musp), 'n': n, 'z': z, 'beta': beta,
+                       'motion': motion, 'aDb': _plain(aDb), 'fs': float(fs),
+                       'noise_level': None if noise_level is None else _plain(noise_level),
+                       'noise_type': noise_type, **motion_params}
     if decomposed:
         history_params.update({'alpha': alpha, 'Db': Db})
     stream.add_history('simulate_dcs_stream', history_params)
@@ -606,7 +648,8 @@ def simulate_two_layer_dcs_stream(probe, mua, musp, n, depth, taus, wavelength=N
     Parameters
     ----------
     probe : Probe
-        Must carry a channel configuration, with distances in cm.
+        Must carry a channel configuration. Distances are converted to cm
+        from ``probe.lengthUnit``; a probe without a unit is read as cm.
     mua, musp : array-like
         Absorption and reduced scattering per layer in cm^-1.
     n : array-like
@@ -659,7 +702,7 @@ def simulate_two_layer_dcs_stream(probe, mua, musp, n, depth, taus, wavelength=N
     if wavelength is None:
         wavelength = float(probe.wavelengths[0])
 
-    distances = np.array(probe.distances, dtype=float)
+    distances = probe_distances_cm(probe, untagged='cm')
     n_ch = len(distances)
     taus = np.asarray(taus, dtype=float)
     n_tau = len(taus)
@@ -710,7 +753,8 @@ def simulate_n_layer_dcs_stream(probe, mua, musp, n, depth, taus, wavelength=Non
     Parameters
     ----------
     probe : Probe
-        Must carry a channel configuration, with distances in cm.
+        Must carry a channel configuration. Distances are converted to cm
+        from ``probe.lengthUnit``; a probe without a unit is read as cm.
     mua, musp : array-like
         Absorption and reduced scattering per layer in cm^-1.
     n : array-like
@@ -763,7 +807,7 @@ def simulate_n_layer_dcs_stream(probe, mua, musp, n, depth, taus, wavelength=Non
     if wavelength is None:
         wavelength = float(probe.wavelengths[0])
 
-    distances = np.array(probe.distances, dtype=float)
+    distances = probe_distances_cm(probe, untagged='cm')
     n_ch = len(distances)
     taus = np.asarray(taus, dtype=float)
     n_tau = len(taus)

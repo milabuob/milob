@@ -1,10 +1,8 @@
 import numpy as np
 import xarray as xr
 import copy
-from scipy.optimize import curve_fit, minimize
-from scipy.signal import convolve
-from scipy.special import erfc
 import re
+from ..core.units import cm_per_unit
 
 # ------------------------------------------------------------------
 # Modality conversion
@@ -262,8 +260,7 @@ def calculate_optical_properties_moments(datastream_mom, n=1.37):
     # stream already storing distances in cm, e.g. every
     # forward.dos.simulate_*_td_stream output.
     distances = data.distance
-    if data.attrs.get('lengthUnit') == 'mm':
-        distances = distances / 10.0
+    distances = distances * cm_per_unit(data.attrs.get('lengthUnit'), default='cm')
     rho_cm = xr.DataArray(distances, dims=["channel"])
 
     # --- Constants ---
@@ -375,258 +372,6 @@ def calculate_optical_params(datastream_mom):
     optical_xr.attrs["transformation"] = "moments_to_optical_params"
 
     return optical_xr, metadata
-
-
-# --- FITTING METHOD ---
-# - Utilities -
-def tdde_model(t, mua, mus, A, rho):
-    """
-    Evaluate the time-domain diffusion model for a semi-infinite medium.
-
-    Reflectance at the surface for a pencil beam incident on a homogeneous
-    half-space, under the extrapolated-boundary solution of the
-    time-dependent diffusion equation. Refractive index is fixed at 1.37.
-
-    Parameters
-    ----------
-    t : array-like
-        Photon time of flight in ns. Values are floored at 1e-10 to keep
-        the singularity at zero out of the expression.
-    mua : float
-        Absorption coefficient in mm^-1.
-    mus : float
-        Reduced scattering coefficient in mm^-1.
-    A : float
-        Amplitude scaling the curve onto the measured photon counts.
-    rho : float
-        Source-detector separation in mm.
-
-    Returns
-    -------
-    numpy.ndarray
-        Reflectance at each time point, in the units set by ``A``.
-
-    References
-    ----------
-    .. [1] Patterson, M.S., Chance, B. and Wilson, B.C. (1989). Time resolved
-           reflectance and transmittance for the non-invasive measurement of
-           tissue optical properties. Applied Optics, 28(12), 2331-2336.
-    """
-    n=1.37
-    c=299.792458 / n # c in mm/ns
-
-    t = np.maximum(t, 1e-10)
-    mus = np.maximum(mus, 1e-4)
-
-    D = 1 / (3 * mus)
-    z0 = 1 / mus
-
-    # Patterson TDDE Formula (t in ns)
-    term1 = (4 * np.pi * D * c)**(-1.5) * t**(-2.5)
-    term2e = -mua * c * t - (rho**2 + z0**2) / (4 * D * c * t)
-    # term2 = np.exp(-mua * c * t)
-    # term3 = np.exp(-(rho**2 + z0**2) / (4 * D * c * t))
-
-    # return A*term1*term2*term3
-    return A * term1 * np.exp(np.clip(term2e, -700, 700))
-
-
-def emg_irf(t, t0, sigma, tau):
-    """
-    Evaluate an exponentially modified Gaussian instrument response.
-
-    Parameters
-    ----------
-    t : array-like
-        Time points in seconds.
-    t0 : float
-        Centre of the Gaussian component.
-    sigma : float
-        Width of the Gaussian component.
-    tau : float
-        Decay constant of the exponential tail.
-
-    Returns
-    -------
-    np.ndarray
-        Instrument response evaluated at ``t``.
-    """
-    tau = np.maximum(tau, 1e-5)
-    sigma = np.maximum(sigma, 1e-5)
-
-    # Formula for EMG
-    term1e = (sigma**2 / (2 * tau**2)) - ((t - t0) / tau)
-    term1 = (1 / (2 * tau)) * np.exp(np.clip(term1e, -700, 700))
-
-    term2_arg = (sigma / (np.sqrt(2) * tau)) - ((t - t0) / (np.sqrt(2) * sigma))
-    term2 = erfc(np.clip(term2_arg, -20, 20))
-    return term1 * term2
-
-
-def model_with_irf(t, mua, mus_prime, A, irf_sigma, irf_tau, t_shift, rho):
-    # Generate the asymmetric IRF
-    # use a relative time axis starting near 0 for the kernel
-    """
-    Evaluate the diffusion model convolved with an instrument response.
-
-    The measured curve is the medium's response convolved with the
-    instrument's, so this composes :func:`tdde_model` with an exponentially
-    modified Gaussian from :func:`emg_irf` and returns what an instrument
-    would record. The response is normalised to unit area, leaving the
-    amplitude entirely to ``A``.
-
-    Parameters
-    ----------
-    t : array-like
-        Photon time of flight in ns.
-    mua : float
-        Absorption coefficient in mm^-1.
-    mus_prime : float
-        Reduced scattering coefficient in mm^-1.
-    A : float
-        Amplitude scaling the curve onto the measured photon counts.
-    irf_sigma : float
-        Width in ns of the instrument response's Gaussian component.
-    irf_tau : float
-        Decay constant in ns of its exponential tail.
-    t_shift : float
-        Shift in ns applied to the model before convolution, absorbing the
-        unknown offset between the recorded time axis and the true arrival
-        of the pulse. Times at or before the shifted origin are set to zero.
-    rho : float
-        Source-detector separation in mm.
-
-    Returns
-    -------
-    numpy.ndarray
-        Convolved curve, truncated to the length of ``t``.
-
-    See Also
-    --------
-    tdde_model : The underlying medium response.
-    emg_irf : The instrument response used here.
-    """
-    t_irf = np.linspace(0, t[-1], len(t)) 
-    irf = emg_irf(t_irf, 0.5, irf_sigma, irf_tau)
-
-    irf_sum = np.sum(irf)
-    if irf_sum > 0:
-        irf /= np.sum(irf) # Normalise
-    else:
-        irf = np.zeros_like(irf)
-        irf[len(irf)//2] = 1.0
-
-    # Calculate ideal TPSF
-    t_shifted = t - t_shift
-    ideal_tpsf = tdde_model(t_shifted, mua, mus_prime, A, rho)
-    ideal_tpsf[t_shifted <= 0] = 0
-
-    # 3. Convolve (mode='full' then slice to keep timing aligned)
-    convolved_signal = convolve(ideal_tpsf, irf, mode='full')[:len(t)]
-    return convolved_signal
-
-
-# - Main function -
-def calculate_optical_params_fitting(datastream_gates, initial_guesses, bounds, mu_a=0.01, mu_s=0.1, method='semi_infinite'):
-    """
-    Derive optical properties by fitting the time-dependent diffusion model.
-
-    Assumes a semi-infinite homogeneous medium.
-
-    Parameters
-    ----------
-    datastream_gates : TD_Stream
-        Gated stream to fit.
-    initial_guesses : sequence, optional
-        Starting values for the fitted parameters.
-    bounds : tuple, optional
-        Lower and upper bounds for the fitted parameters.
-    mu_a, mu_s : float, optional
-        Fixed values, where a parameter is not to be fitted.
-    method : str, optional
-        Optimiser passed to the underlying least-squares routine.
-
-    Returns
-    -------
-    xr.DataArray
-        Absorption and reduced scattering, in mm^-1, over time, wavelength
-        and channel. Channels whose fit does not converge are left NaN.
-    """
-    bins = datastream_gates.data.bin
-    num_bins = len(bins)
-    bin_width = datastream_gates.data.timeDelayWidths[0].values
-    bin_delay = datastream_gates.data.timeDelays[0].values
-
-    bin_times = bin_delay + (np.arange(num_bins) * bin_width) + (bin_width/2)
-
-    # n=1.37
-    # c=299.792458 / n # c in mm/ns
-
-    t_ns = np.maximum(bin_times, 1e-10) *1e9 # avoid division by zero and convert from s to ns
-
-    times = datastream_gates.data.time.values
-    wavelengths = datastream_gates.data.wavelength.values
-    channels = datastream_gates.data.channel.values
-
-    # Initialise result storage (mua and mus')
-    results = np.full((len(times), len(wavelengths), len(channels), 2), np.nan)
-
-    if bounds is None:
-        curr_bounds = (
-            (1e-4, 0.3, 0, 0.01, 0.01, -2),   # lower
-            (0.2, 3.0, np.inf, 0.8, 1.5, 10)  # higher
-        )
-
-
-    for t_idx, t_val in enumerate(times):
-        for wl_idx, wl in enumerate(wavelengths):
-            for ch_idx, ch in enumerate(channels):
-
-                # SD separation (rho)
-                # y_slice = datastream_gates.data.sel(wavelength=wl, channel=ch).mean(dim='time')
-                y_slice = datastream_gates.data.sel(time=t_val, wavelength=wl, channel=ch)
-                y_data = y_slice.values
-                rho = float(y_slice.distance.values)
-
-                # Skip if data is all zeros or NaNs (common in experimental gaps)
-                if np.sum(y_data) == 0 or np.isnan(y_data).all():
-                    continue
-
-                if initial_guesses is None:
-                    # irf_tau: ~0.2 to 0.5 ns is typical for the 'tail'
-                    p0 = [0.017, 0.9, np.max(y_data)*1e7, 0.15, 0.3, t_ns[np.argmax(y_data)] - 0.5]
-                else:
-                    p0 = initial_guesses
-
-                try:
-                    fit_func = lambda t, mua, mus, A, sig, tau, shift: \
-                        model_with_irf(t, mua, mus, A, sig, tau, shift, rho) # rho fixed
-                    
-                    popt, _ = curve_fit(fit_func, t_ns, y_data, p0=p0, bounds=curr_bounds)
-                    fit_mua, fit_mus, fit_A, fit_sig, fit_tau, fit_shift = popt
-
-                    results[t_idx, wl_idx, ch_idx, :] = popt[0:2] # store mua and mus'
-
-                except Exception as e:
-                    pass
-
-    # --- Rebuild DataArray ---
-    # Ensure dimensions in dims list match the order of your results array: (time, wavelength, channel, optical_parameter)
-    params_xr = xr.DataArray(
-        results,
-        coords={
-            "time": times,
-            "wavelength": wavelengths,
-            "channel": channels,
-            "optical_parameter": ['mu_a', 'mu_s']
-        },
-        dims=["time", "wavelength", "channel", "optical_parameter"],
-        attrs=datastream_gates.data.attrs.copy()
-    )
-
-    params_xr.attrs['status'] = 'absolute optical parameters'
-
-    return params_xr
 
 
 # ------------------------------------------------------------------
@@ -747,6 +492,92 @@ def opt_params_to_conc(mua, water_corr, water_frac, attrs=None,
     return out, var_out
 
 
+def calculate_dpf_moments(td_stream, n=1.44, mode='static'):
+    """
+    Estimate the differential pathlength factor from the first TD moment.
 
+    Uses the semi-infinite homogeneous approximation
+    ``DPF = (c / n) * m1 / rho``, with ``m1`` the mean time of flight and
+    ``rho`` the source-detector separation.
 
-# ADD DPF FUNCTION - MS
+    Parameters
+    ----------
+    td_stream : TD_Stream
+        Stream with ``status='raw'`` or ``status='moment'``. Raw gated data is
+        converted to moments first.
+    n : float
+        Refractive index of the medium. Default 1.44.
+    mode : {'static', 'timeseries'}
+        'static' averages over time and returns dims (channel, wavelength).
+        'timeseries' keeps the time axis when present, returning
+        (time, channel, wavelength).
+
+    Returns
+    -------
+    xarray.DataArray
+        DPF values named 'dpf', with the refractive index and mode in
+        ``attrs``.
+
+    Raises
+    ------
+    ValueError
+        If ``mode`` is unknown, the stream status is not 'raw' or 'moment', or
+        the moment data lacks ``m1`` or a 'distance' coordinate.
+    """
+    if mode not in {'static', 'timeseries'}:
+        raise ValueError(f"Mode must be 'static' or 'timeseries'. Got {mode!r}.")
+
+    if td_stream.status == 'raw':
+        moments = td_stream.to_moments()
+    elif td_stream.status == 'moment':
+        moments = td_stream
+    else:
+        raise ValueError(
+            f"calculate_dpf() requires TD data with status='raw' or 'moment'. Got status='{td_stream.status}'."
+        )
+
+    if 'moment' not in moments.data.dims:
+        raise ValueError("Moment data is required: 'moment' dimension was not found.")
+
+    moment_names = np.asarray(moments.data.coords['moment'].values)
+    if 'm1' not in moment_names:
+        raise ValueError(
+            "The first temporal moment 'm1' is required to compute DPF. "
+            f"Available moments: {moment_names.tolist()}"
+        )
+
+    # Select the mean-arrival-time moment (m1)
+    m1 = moments.data.sel(moment='m1')
+
+    # Ensure we have the channel distance coordinate
+    if 'distance' not in moments.data.coords:
+        raise ValueError("TD data does not have a 'distance' coordinate for source-detector separation.")
+
+    rho = moments.data.coords['distance']
+    rho = rho * cm_per_unit(moments.data.attrs.get('lengthUnit'), default='cm')
+
+    c_cm = 2.99792458e10        # Speed of light  [cm/s]
+
+    # Compute DPF = (c / n) * m1 / rho
+    dpf = (c_cm / float(n)) * m1 / rho
+
+    if mode == 'static':
+        if 'time' in dpf.dims:
+            dpf = dpf.mean(dim='time', skipna=True)
+        dpf = dpf.transpose('channel', 'wavelength')
+
+    elif mode == 'timeseries':
+        # Keep time axis when present; otherwise leave as channel/wavelength
+        if 'time' in dpf.dims:
+            dpf = dpf.transpose('time', 'channel', 'wavelength')
+
+    dpf.name = 'dpf'
+    dpf.attrs.update({
+        'description': 'differential pathlength factor',
+        'units': 'dimensionless',
+        'refractive_index': float(n),
+        'formula': 'DPF = (c / n) * m1 / rho',
+        'mode': mode,
+    })
+
+    return dpf
