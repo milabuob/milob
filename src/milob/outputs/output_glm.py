@@ -25,6 +25,106 @@ def _fdr_bh(p_values, axis):
 
     return adjusted
 
+#: Payload levels whose expected response direction is known: a task-evoked
+#: haemodynamic response raises HbO and HbT and lowers HbR. The check is on
+#: the level names, not the dimension name, so a TissueStream 'component'
+#: axis holding HbO/HbR qualifies. Nothing else has such a convention -- an
+#: un-unmixed wavelength, a 'combined' Fisher map, a scattering component --
+#: which is why tail='directional' refuses those rather than quietly calling
+#: them non-significant.
+_EXPECTED_SIGN = {'HbO': +1, 'HbT': +1, 'HbR': -1}
+
+
+def _resolve_tail(tail, outputs):
+    """
+    The tail a derived output should report: the caller's, if given, else
+    the one its inputs were built with.
+
+    Averaging or ROI-pooling a directional output must not quietly turn it
+    back into a two-tailed one, so ``None`` means "inherit". Inputs that
+    disagree have no single convention to inherit, and that is refused.
+    """
+    if tail is not None:
+        return tail
+    tails = {o.output.attrs.get('tail', 'two') for o in outputs}
+    if len(tails) > 1:
+        raise ValueError(
+            f"Inputs were built with different tails {sorted(tails)}; pass "
+            f"tail= explicitly.")
+    return tails.pop()
+
+
+def _p_and_significance(t_values, df, alpha, tail, payload_levels, payload_axis):
+    """
+    p-values and the significance mask, derived here for every GLMOutput
+    method so that no two of them can drift apart on what "significant" means.
+
+    ``tail='two'``
+        Two-tailed, and the default. The only defensible choice for an
+        arbitrary contrast: ``A - B`` between two active conditions is
+        negative exactly when B > A, which is a result rather than a null,
+        and a contrast written ``Rest - Task`` inverts the expected sign.
+    ``tail='directional'``
+        One-tailed, in the direction a task-evoked response is expected to
+        take: ``c'beta > 0`` for HbO/HbT, ``c'beta < 0`` for HbR. For a
+        contrast written ``A - B`` that is "A evokes the larger response",
+        on every chromophore at once. Defined only for the payload levels in
+        ``_EXPECTED_SIGN``.
+
+    The returned ``p_values`` always describe the test the mask reports, so
+    filtering on ``p_val < alpha`` and filtering on ``is_significant`` cannot
+    give different answers for the same output.
+
+    ``df`` is a scalar for a subject-level GLM, or an array shaped like
+    ``t_values`` for a group model, where it is ``n_subjects - 1`` per cell.
+    """
+    df = np.broadcast_to(np.asarray(df, dtype=float), np.shape(t_values))
+    if tail == 'two':
+        p = np.clip(2 * (1 - stats.t.cdf(np.abs(t_values), df)), 0.0, 1.0)
+        return p, p < alpha
+
+    if tail != 'directional':
+        raise ValueError(f"tail must be 'two' or 'directional', got {tail!r}.")
+
+    unknown = [lv for lv in payload_levels if lv not in _EXPECTED_SIGN]
+    if unknown:
+        raise ValueError(
+            f"tail='directional' has no expected response direction for "
+            f"{unknown}. It is defined only for {sorted(_EXPECTED_SIGN)}; "
+            f"pass tail='two' for this output."
+        )
+
+    p = np.empty(np.shape(t_values), dtype=float)
+    index = [slice(None)] * np.ndim(t_values)
+    for i, level in enumerate(payload_levels):
+        index[payload_axis] = i
+        sl = tuple(index)
+        # sf = P(T > t), the tail for an expected increase; cdf = P(T < t)
+        # for an expected decrease.
+        p[sl] = (stats.t.sf(t_values[sl], df[sl]) if _EXPECTED_SIGN[level] > 0
+                 else stats.t.cdf(t_values[sl], df[sl]))
+
+    p = np.clip(p, 0.0, 1.0)
+    return p, p < alpha
+
+
+def contrast_vector(c_logic, reg_names):
+    """
+    Contrast weights over ``reg_names`` from ``{label: weight}`` or a plain
+    list in regressor order. The one definition every contrast in milob is
+    built from -- observed (``compute_contrasts``) and permuted
+    (``GLM.circular_shift_null``) alike -- so the two cannot disagree.
+    """
+    if isinstance(c_logic, dict):
+        c_vector = np.zeros(len(reg_names))
+        for label, weight in c_logic.items():
+            if label in reg_names:
+                c_vector[reg_names.index(label)] = weight
+            else:
+                print(f"Warning: Regressor '{label}' not found in this session.")
+        return c_vector
+    return np.asarray(c_logic, dtype=float)
+
 
 class GLMOutput(BaseOutput):
     """
@@ -82,7 +182,7 @@ class GLMOutput(BaseOutput):
         raise ValueError(f"No payload dimension in {tuple(self.output.dims)}.")
 
     @classmethod
-    def average(cls, outputs, alpha=0.05):
+    def average(cls, outputs, alpha=0.05, tail=None):
         """
         Average several GLM outputs into one.
 
@@ -98,6 +198,11 @@ class GLMOutput(BaseOutput):
             :meth:`compute_contrasts`.
         alpha : float, optional
             Significance threshold. Default is 0.05.
+        tail : {'two', 'directional'}, optional
+            Which test ``is_significant`` reports, with the same meaning as
+            in ``compute_contrasts()``. Default None inherits the tail the
+            inputs were built with, so a directional analysis stays
+            directional when it is averaged.
 
         Returns
         -------
@@ -108,12 +213,6 @@ class GLMOutput(BaseOutput):
         ------
         ValueError
             If any input has not been through :meth:`compute_contrasts`.
-
-        Notes
-        -----
-        Unlike :meth:`compute_contrasts`, ``is_significant`` is set by a
-        one-tailed test in the expected direction: an increase for HbO and
-        HbT, a decrease for HbR.
         """
         import warnings
 
@@ -137,23 +236,22 @@ class GLMOutput(BaseOutput):
             beta_avg = np.nanmean(beta_stack, axis=0)
             se_avg   = np.sqrt(np.nanmean(se_stack ** 2, axis=0) / N_valid)
 
+        tail      = _resolve_tail(tail, outputs)
         df_total  = sum(o.output.attrs.get('df', 100) for o in outputs)
         t_values  = np.where(se_avg > 0, beta_avg / se_avg, np.nan)
-        p_values  = 2 * (1 - stats.t.cdf(np.abs(t_values), df_total))
-        p_upper   = stats.t.sf(t_values, df_total)
-        p_lower   = stats.t.cdf(t_values, df_total)
+        # p_values  = 2 * (1 - stats.t.cdf(np.abs(t_values), df_total))
+        # p_upper   = stats.t.sf(t_values, df_total)
+        # p_lower   = stats.t.cdf(t_values, df_total)
 
         pdim      = next(d for d in ('chromophore', 'component', 'wavelength')
                          if d in ref.dims)
-        chrom     = list(ref.coords[pdim].values)
-        is_sig    = np.zeros_like(beta_avg, dtype=bool)
-        for i, c in enumerate(chrom):
-            if c in ('HbO', 'HbT'):
-                is_sig[..., i] = p_upper[..., i] < alpha
-            elif c == 'HbR':
-                is_sig[..., i] = p_lower[..., i] < alpha
+        dims = list(ref['beta'].dims)
 
-        dims   = list(ref['beta'].dims)
+        p_values, is_sig = _p_and_significance(
+            t_values, df_total, alpha, tail,
+            list(ref.coords[pdim].values), dims.index(pdim)
+        )
+
         coords = {d: ref.coords[d] for d in dims}
         ds = xr.Dataset(
             data_vars={
@@ -164,7 +262,7 @@ class GLMOutput(BaseOutput):
                 'is_significant': (dims, is_sig),
             },
             coords=coords,
-            attrs={'df': df_total},
+            attrs={'df': df_total, 'tail': tail},
         )
         return cls(data=ds, probe=outputs[0].probe,
                    analysis_type=outputs[0].analysis_type,
@@ -172,9 +270,9 @@ class GLMOutput(BaseOutput):
                    history=cls._consolidate_histories(outputs, 'GLMOutput.average'))
 
     
-    def compute_contrasts(self, contrast_dict, alpha=0.05, fdr_correction=False):
+    def compute_contrasts(self, contrast_dict, alpha=0.05, fdr_correction=False, tail='two'):
         """
-        Evaluate contrasts of the fitted regressors.
+        Calculate t-stats, p-values, and significance from contrast vectors.
 
         Parameters
         ----------
@@ -196,6 +294,22 @@ class GLMOutput(BaseOutput):
             are dependent readings of one response and pooling them would
             enlarge the family without adding an independent test. Default is
             False.
+        tail : {'two', 'directional'}
+            ``'two'`` (default) tests each contrast two-tailed, which is what
+            an arbitrary contrast calls for: A - B between two active
+            conditions is negative exactly when B > A, and that is a result,
+            not a null.
+            ``'directional'`` tests one-tailed in the direction a task-evoked
+            response is expected to take: ``c'beta > 0`` for HbO/HbT and
+            ``c'beta < 0`` for HbR.  Write the contrast with the condition
+            hypothesised to respond more first -- ``{"A": 1, "B": -1}`` then
+            tests "A evokes the larger response than B" on every chromophore,
+            and against baseline it is plain activation.  The direction must
+            be fixed before looking at the data.  It is defined only for the
+            HbO/HbR/HbT payload levels (whether the axis is called
+            ``chromophore`` or ``component``); on wavelengths or other
+            components it raises rather than reporting nothing as
+            significant.
 
         Returns
         -------
@@ -205,11 +319,6 @@ class GLMOutput(BaseOutput):
             ``fdr_correction``, ``p_val`` holds the adjusted values, so every
             downstream table and plot reflects the correction, and the raw
             values are kept as ``p_val_uncorrected``.
-
-        Notes
-        -----
-        p-values are two-tailed, and ``is_significant`` is not
-        direction-specific.
 
         References
         ----------
@@ -247,13 +356,13 @@ class GLMOutput(BaseOutput):
             
             # Calculate Contrast Beta: c' * Beta
             # Sums across the 'regressor' dimension
-            con_beta = (self.output.beta * c).sum(dim='regressor')
+            con_beta = (self.output.beta * c).sum(dim='regressor', skipna=False)
             
             # Calculate Contrast Variance: c' * Cov * c
             cj = c.rename({'regressor': 'regressor_j'})
             ci = c.rename({'regressor': 'regressor_i'})
-            tmp = (self.output.covariance * cj).sum(dim='regressor_j')
-            con_var = (tmp * ci).sum(dim='regressor_i')
+            tmp = (self.output.covariance * cj).sum(dim='regressor_j', skipna=False)
+            con_var = (tmp * ci).sum(dim='regressor_i', skipna=False)
             
             # Calculate Stats
             beta_vals = con_beta.values
@@ -261,30 +370,19 @@ class GLMOutput(BaseOutput):
             se_values = np.sqrt(var_vals)
 
             t_values = beta_vals / se_values
-            p_values = 2 * (1 - stats.t.cdf(np.abs(t_values), df)) # two-tailed
+
+            pdim = next(d for d in ('chromophore', 'component', 'wavelength')
+                        if d in con_beta.dims)
+
+            p_values, is_sig = _p_and_significance(
+                t_values, df, alpha, tail,
+                list(con_beta.coords[pdim].values), core_dims.index(pdim)
+            )
 
             p_uncorrected = p_values
             if fdr_correction:
                 p_values = _fdr_bh(p_values, axis=core_dims.index(self.spatial_dim))
-
-            # Calculating one-tailed p-value for is_significant mask to account for expected response
-            p_upper = stats.t.sf(t_values, df)
-            p_lower = stats.t.cdf(t_values, df)
-
-            pdim = next(d for d in ('chromophore', 'component', 'wavelength')
-                        if d in con_beta.dims)
-            chrom = list(con_beta.coords[pdim].values)
-            is_sig = np.zeros_like(beta_vals, dtype=bool)
-
-            # for i, chrom in enumerate(chrom):
-            #     if chrom == "HbO":
-            #         is_sig[:, i] = (p_upper[:, i] < alpha)
-            #     elif chrom == "HbR":
-            #         is_sig[:, i] = (p_lower[:, i] < alpha)
-            #     elif chrom == "HbT":
-            #         is_sig[:, i] = p_upper[:, i] < alpha
-
-            is_sig = p_values < alpha # not direction-specific
+                is_sig = p_values < alpha   # update significance after FDR correction
 
             # Store in Dataset
             data_vars = {
@@ -306,13 +404,12 @@ class GLMOutput(BaseOutput):
             
         # Combine all contrasts
         contrast_results = xr.concat(results_list, dim='contrast')
-        
-        # Carry the input's provenance (stream history + GLM.fit) forward and
-        # record this step, so an "Inference" output stays self-documenting.
+
         history = list(self.history) + [self._history_entry(
             'GLMOutput.compute_contrasts',
             {'contrasts': list(contrast_dict.keys()),
              'alpha': alpha,
+             'tail': tail,
              'fdr_correction': fdr_correction},
         )]
 
@@ -368,7 +465,6 @@ class GLMOutput(BaseOutput):
                 'p_val': (current_dims, combined_p),
                 'beta': (current_dims, hbo.beta.values - hbr.beta.values),
                 'is_significant': (current_dims, (combined_p < alpha) & valid_mask)
-                # 'is_significant': (current_dims, (combined_p < alpha) & valid_mask & hbo.is_significant.values & hbr.is_significant.values)
             },
             # Use the coords from the original hbo slice
             coords=hbo.coords
