@@ -6,12 +6,9 @@ Continuous wave is the zero-frequency case.
 """
 
 import numpy as np
-import xarray as xr
 
 from . import kernels
 from . import dispersion
-from ._geometry import probe_distances_cm
-from .noise_models import fd_noise_model
 
 
 def si_fd_fluence(rho, mua, musp, n, wavelength, freq=0.0, R_eff=None):
@@ -75,7 +72,7 @@ def _layer_R_eff(n):
 
 
 def two_layer_fd_fluence(rho, z, mua, musp, n, wavelength, depth, freq=0.0,
-                          R_eff=None, a=30.0, m=4000):
+                          R_eff=None, a=30.0, m=8000, m_tol=1e-8):
     """
     Two-layer CW or FD-DOS fluence, for a finite layer over a semi-infinite one.
 
@@ -103,7 +100,10 @@ def two_layer_fd_fluence(rho, z, mua, musp, n, wavelength, depth, freq=0.0,
     a : float
         Radius in cm truncating the Fourier-Bessel series.
     m : int
-        Number of terms in the series.
+        Maximum number of terms in the series.
+    m_tol : float
+        Relative tolerance at which the series stops; see
+        :func:`~milob.forward.kernels.two_layer_kernel`.
 
     Returns
     -------
@@ -122,12 +122,12 @@ def two_layer_fd_fluence(rho, z, mua, musp, n, wavelength, depth, freq=0.0,
     K_sq = [complex(dispersion.k2(mua[i], musp[i], n[i], wavelength, freq=freq))
             for i in range(n_layers)]
 
-    f = kernels.two_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff, a=a, m=m)
+    f = kernels.two_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff, a=a, m=m, m_tol=m_tol)
     return complex(f)
 
 
 def n_layer_fd_fluence(rho, z, mua, musp, n, wavelength, depth, freq=0.0,
-                        R_eff_top=None, R_eff_bottom=None, s_max_factor=30.0, n_points=480):
+                        R_eff_top=None, R_eff_bottom=None, s_max_factor=30.0, n_points=None):
     """
     General N-layer CW or FD-DOS fluence.
 
@@ -158,8 +158,9 @@ def n_layer_fd_fluence(rho, z, mua, musp, n, wavelength, depth, freq=0.0,
     s_max_factor : float
         Upper integration limit of the Hankel transform, as a multiple of the
         source layer's reduced scattering.
-    n_points : int
-        Number of quadrature points.
+    n_points : int, optional
+        Number of quadrature points. None (default) chooses it from the
+        separation; see :func:`~milob.forward.kernels.n_layer_kernel`.
 
     Returns
     -------
@@ -354,7 +355,7 @@ def si_td_fluence_patterson(t, rho, mua, musp, n, A=1.0):
 
 
 def two_layer_td_fluence(t, rho, z, mua, musp, n, wavelength, depth,
-                          R_eff=None, a=30.0, m=4000, freq_max=None, n_freq=None):
+                          R_eff=None, a=30.0, m=8000, m_tol=1e-8, freq_max=None, n_freq=None):
     """
     Two-layer TD-DOS fluence, by frequency sweep and inverse transform.
 
@@ -368,11 +369,11 @@ def two_layer_td_fluence(t, rho, z, mua, musp, n, wavelength, depth,
     """
     return _fd_sweep_to_td(two_layer_fd_fluence, t, freq_max=freq_max, n_freq=n_freq,
                             rho=rho, z=z, mua=mua, musp=musp, n=n, wavelength=wavelength,
-                            depth=depth, R_eff=R_eff, a=a, m=m)
+                            depth=depth, R_eff=R_eff, a=a, m=m, m_tol=m_tol)
 
 
 def n_layer_td_fluence(t, rho, z, mua, musp, n, wavelength, depth,
-                        R_eff_top=None, R_eff_bottom=None, s_max_factor=30.0, n_points=480,
+                        R_eff_top=None, R_eff_bottom=None, s_max_factor=30.0, n_points=None,
                         freq_max=None, n_freq=None):
     """
     General N-layer TD-DOS fluence, by frequency sweep and inverse transform.
@@ -400,13 +401,8 @@ def n_layer_td_fluence(t, rho, z, mua, musp, n, wavelength, depth,
 # ------------------------------------------------------------------
 
 def _two_layer_series_kwargs(flat):
-    """Extract the optional Fourier-Bessel truncation settings from a parameter dict."""
-    kwargs = {}
-    if "a" in flat:
-        kwargs["a"] = flat["a"]
-    if "m" in flat:
-        kwargs["m"] = flat["m"]
-    return kwargs
+    """Extract the optional Fourier-Bessel series settings (a, m, m_tol) from a parameter dict."""
+    return {k: flat[k] for k in ("a", "m", "m_tol") if k in flat}
 
 
 def assemble_two_layer_fd(flat):
@@ -581,299 +577,8 @@ def _fd_freq_axis(modulation_freq):
     return np.array([0.0]) if f == 0.0 else np.array([0.0, f])
 
 
-def simulate_fd_stream(probe, mua, musp, modulation_freq, n=1.33,
-                        noise_level=None, rng=None, noise_type="proportional",
-                        fs=1.0):
-    """
-    Simulate an FD-DOS dataset for a semi-infinite homogeneous medium.
-
-    Parameters
-    ----------
-    probe : Probe
-        Must carry a channel configuration. Distances are converted to cm
-        from ``probe.lengthUnit``; a probe without a unit is read as cm.
-    mua, musp : array-like
-        Absorption and reduced scattering in cm^-1, shape (n_wavelengths,)
-        or (n_times, n_wavelengths) for a time series. The two broadcast
-        against each other along time.
-    modulation_freq : float
-        Modulation frequency in Hz.
-    n : float
-        Refractive index. Default 1.33.
-    noise_level : float or array-like, optional
-        Relative noise on the complex fluence: one value, or one per
-        channel. None adds none. See ``noise_type``.
-    rng : int or numpy.random.Generator, optional
-        Seed or generator for reproducible noise.
-    noise_type : {"proportional", "shot"}
-        ``"proportional"`` applies ``noise_level`` directly to each channel.
-        ``"shot"`` takes ``noise_level`` as the noise at the shortest channel
-        and scales the others as sqrt(AC_ref / AC). See
-        :func:`~milob.forward.noise_models.fd_noise_model`.
-    fs : float
-        Sampling rate in Hz, setting the time coordinate. Default 1.0.
-
-    Returns
-    -------
-    FD_Stream
-        Shape (n_times, n_channels, n_wavelengths, 2), with the DC and
-        modulation frequencies on the last axis.
-
-    Raises
-    ------
-    ValueError
-        If ``mua`` or ``musp`` does not match the probe wavelengths, or their
-        time axes differ.
-    """
-    from ..core.fd_nirs import FD_Stream
-
-    n_wl = len(probe.wavelengths)
-    mua_t = _per_time_wavelength(mua, n_wl, "mua")
-    musp_t = _per_time_wavelength(musp, n_wl, "musp")
-    try:
-        mua_t, musp_t = np.broadcast_arrays(mua_t, musp_t)
-    except ValueError:
-        raise ValueError(f"mua and musp have different numbers of time points: "
-                         f"{mua_t.shape[0]} vs {musp_t.shape[0]}.") from None
-    n_time = mua_t.shape[0]
-
-    distances = probe_distances_cm(probe, untagged='cm')
-    n_ch = len(distances)
-    freqs = _fd_freq_axis(modulation_freq)
-
-    R_eff = kernels.Reff(n, 1.0)
-    data = np.zeros((n_time, n_ch, n_wl, len(freqs)), dtype=complex)
-
-    for ti in range(n_time):
-        for wi in range(n_wl):
-            phi = si_fd_fluence(distances, mua_t[ti, wi], musp_t[ti, wi], n,
-                                probe.wavelengths[wi], freq=freqs, R_eff=R_eff)
-            # Conjugate to match the library phase convention: positive imaginary part
-            # encodes positive phase delay (as stored by the OxiplexTS instrument).
-            # si_fd_fluence returns physics-convention fluence (negative imaginary
-            # part for a delayed signal).
-            data[ti, :, wi, :] = np.conj(phi)
-
-    if noise_level is not None:
-        data = fd_noise_model(data, noise_level, rng=rng, noise_type=noise_type,
-                              distances=distances)
-
-    data_xr = xr.DataArray(
-        data,
-        dims=['time', 'channel', 'wavelength', 'freq'],
-        coords={
-            'time': np.arange(n_time) / float(fs),
-            'channel': probe.channel_labels,
-            'wavelength': probe.wavelengths,
-            'freq': freqs,
-            'distance': ('channel', distances),
-        },
-        attrs={'status': 'raw', 'lengthUnit': 'cm', 'sampling_rate': float(fs)},
-    )
-
-    stream = FD_Stream(data=data_xr, probe=probe, name='simulated_fd', status='raw')
-    stream.add_history('simulate_fd_stream', {
-        'mua': mua_t.tolist() if n_time > 1 else mua_t[0].tolist(),
-        'musp': musp_t.tolist() if n_time > 1 else musp_t[0].tolist(),
-        'n': n, 'modulation_freq': modulation_freq, 'fs': float(fs),
-        'noise_level': None if noise_level is None else np.asarray(noise_level, dtype=float).tolist(),
-        'noise_type': noise_type,
-    })
-    return stream
-
-
-def _per_time_wavelength(values, n_wl, name):
-    """Reshape a (n_wl,) or (n_time, n_wl) input to (n_time, n_wl)."""
-    values = np.asarray(values, dtype=float)
-    if values.shape == (n_wl,):
-        return values[None, :]
-    if values.ndim == 2 and values.shape[1] == n_wl:
-        return values
-    raise ValueError(f"{name} must have shape ({n_wl},) or (n_times, {n_wl}) to match "
-                     f"the probe wavelengths, got {values.shape}.")
-
-
-def simulate_two_layer_fd_stream(probe, mua, musp, n, depth, modulation_freq,
-                                  noise_level=None, rng=None, noise_type="proportional",
-                                  a=30.0, m=4000):
-    """
-    Simulate an FD-DOS dataset for a two-layer medium.
-
-    Parameters
-    ----------
-    probe : Probe
-        Must carry a channel configuration. Distances are converted to cm
-        from ``probe.lengthUnit``; a probe without a unit is read as cm.
-    mua, musp : array-like
-        Shape (n_layers, n_wavelengths), in cm^-1, top layer first.
-    n : array-like
-        Refractive index per layer, shared across wavelengths.
-    depth : array-like
-        Thickness in cm of each bounded layer.
-    modulation_freq : float
-        Modulation frequency in Hz.
-    noise_level : float or array-like, optional
-        Relative noise on the complex fluence: one value, or one per
-        channel. None adds none.
-    rng : int or numpy.random.Generator, optional
-        Seed or generator for reproducible noise.
-    noise_type : {"proportional", "shot"}
-        As in :func:`simulate_fd_stream`.
-    a : float
-        Radius in cm truncating the Fourier-Bessel series.
-    m : int
-        Number of terms. The default is accurate but slow; reduce it for
-        exploratory runs.
-
-    Returns
-    -------
-    FD_Stream
-        Shape (1, n_channels, n_wavelengths, 2).
-    """
-    from ..core.fd_nirs import FD_Stream
-
-    mua = np.asarray(mua, dtype=float)
-    musp = np.asarray(musp, dtype=float)
-    n = np.asarray(n, dtype=float)
-    depth = np.asarray(depth, dtype=float)
-    n_layers, n_wl = mua.shape
-
-    if musp.shape != (n_layers, n_wl):
-        raise ValueError(f"musp must have shape {(n_layers, n_wl)} to match mua, got {musp.shape}.")
-    if len(n) != n_layers:
-        raise ValueError(f"n must have shape ({n_layers},), one refractive index per layer, got {n.shape}.")
-
-    n_wl_probe = len(probe.wavelengths)
-    if n_wl != n_wl_probe:
-        raise ValueError(f"mua/musp must have shape ({n_layers}, {n_wl_probe}) to match probe wavelengths, got {mua.shape}.")
-
-    distances = probe_distances_cm(probe, untagged='cm')
-    n_ch = len(distances)
-    freqs = _fd_freq_axis(modulation_freq)
-
-    data = np.zeros((1, n_ch, n_wl, len(freqs)), dtype=complex)
-    for wi in range(n_wl):
-        wl = float(probe.wavelengths[wi])
-        for ci, rho in enumerate(distances):
-            for fi, f in enumerate(freqs):
-                phi = two_layer_fd_fluence(rho=rho, z=0.0, mua=mua[:, wi], musp=musp[:, wi],
-                                            n=n, wavelength=wl, depth=depth, freq=f, a=a, m=m)
-                # Same phase-convention conjugation as simulate_fd_stream.
-                data[0, ci, wi, fi] = np.conj(phi)
-
-    if noise_level is not None:
-        data = fd_noise_model(data, noise_level, rng=rng, noise_type=noise_type,
-                              distances=distances)
-
-    data_xr = xr.DataArray(
-        data,
-        dims=['time', 'channel', 'wavelength', 'freq'],
-        coords={
-            'time': [0.0],
-            'channel': probe.channel_labels,
-            'wavelength': probe.wavelengths,
-            'freq': freqs,
-            'distance': ('channel', distances),
-        },
-        attrs={'status': 'raw', 'lengthUnit': 'cm'},
-    )
-
-    return FD_Stream(data=data_xr, probe=probe, name='simulated_two_layer_fd', status='raw')
-
-
-def simulate_n_layer_fd_stream(probe, mua, musp, n, depth, modulation_freq,
-                                noise_level=None, rng=None, noise_type="proportional",
-                                s_max_factor=30.0, n_points=480):
-    """
-    Simulate an FD-DOS dataset for a general N-layer medium.
-
-    Parameters
-    ----------
-    probe : Probe
-        Must carry a channel configuration. Distances are converted to cm
-        from ``probe.lengthUnit``; a probe without a unit is read as cm.
-    mua, musp : array-like
-        Shape (n_layers, n_wavelengths), in cm^-1, top layer first.
-    n : array-like
-        Refractive index per layer.
-    depth : array-like
-        Thickness in cm of each bounded layer.
-    modulation_freq : float
-        Modulation frequency in Hz.
-    noise_level : float or array-like, optional
-        Relative noise on the complex fluence: one value, or one per
-        channel. None adds none.
-    rng : int or numpy.random.Generator, optional
-        Seed or generator for reproducible noise.
-    noise_type : {"proportional", "shot"}
-        As in :func:`simulate_fd_stream`.
-    s_max_factor : float
-        Upper integration limit of the Hankel transform.
-    n_points : int
-        Number of quadrature points.
-
-    Returns
-    -------
-    FD_Stream
-        Shape (1, n_channels, n_wavelengths, 2).
-    """
-    from ..core.fd_nirs import FD_Stream
-
-    mua = np.asarray(mua, dtype=float)
-    musp = np.asarray(musp, dtype=float)
-    n = np.asarray(n, dtype=float)
-    depth = np.asarray(depth, dtype=float)
-    n_layers, n_wl = mua.shape
-
-    if musp.shape != (n_layers, n_wl):
-        raise ValueError(f"musp must have shape {(n_layers, n_wl)} to match mua, got {musp.shape}.")
-    if len(n) != n_layers:
-        raise ValueError(f"n must have shape ({n_layers},), one refractive index per layer, got {n.shape}.")
-
-    n_wl_probe = len(probe.wavelengths)
-    if n_wl != n_wl_probe:
-        raise ValueError(f"mua/musp must have shape ({n_layers}, {n_wl_probe}) to match probe wavelengths, got {mua.shape}.")
-
-    distances = probe_distances_cm(probe, untagged='cm')
-    n_ch = len(distances)
-    freqs = _fd_freq_axis(modulation_freq)
-
-    data = np.zeros((1, n_ch, n_wl, len(freqs)), dtype=complex)
-    for wi in range(n_wl):
-        wl = float(probe.wavelengths[wi])
-        for ci, rho in enumerate(distances):
-            for fi, f in enumerate(freqs):
-                phi = n_layer_fd_fluence(rho=rho, z=0.0, mua=mua[:, wi], musp=musp[:, wi],
-                                          n=n, wavelength=wl, depth=depth, freq=f,
-                                          s_max_factor=s_max_factor, n_points=n_points)
-                # Same phase-convention conjugation as simulate_fd_stream.
-                data[0, ci, wi, fi] = np.conj(phi)
-
-    if noise_level is not None:
-        data = fd_noise_model(data, noise_level, rng=rng, noise_type=noise_type,
-                              distances=distances)
-
-    data_xr = xr.DataArray(
-        data,
-        dims=['time', 'channel', 'wavelength', 'freq'],
-        coords={
-            'time': [0.0],
-            'channel': probe.channel_labels,
-            'wavelength': probe.wavelengths,
-            'freq': freqs,
-            'distance': ('channel', distances),
-        },
-        attrs={'status': 'raw', 'lengthUnit': 'cm'},
-    )
-
-    return FD_Stream(data=data_xr, probe=probe, name='simulated_n_layer_fd', status='raw')
-
-
 # ------------------------------------------------------------------
-# TD-DOS simulation -- one per geometry, mirroring the FD ``simulate_*``
-# functions above exactly (same probe/mua/musp/n/depth-style signature),
-# swapping ``modulation_freq``/``freq`` for a gated time axis
-# (``bin_width``/``n_bins``) built on the FD-sweep fluence functions above.
+# TD-DOS gating helpers, used by ``forward.simulate.simulate_td_stream``.
 # ------------------------------------------------------------------
 
 def _bin_td_fluence(fluence_func, bin_delays, bin_widths, **fluence_kwargs):
@@ -908,199 +613,11 @@ def _default_td_gates(bin_width, n_bins):
     return bin_delays, bin_widths
 
 
-def _td_data_xr(data, probe, distances, bin_delays, bin_widths):
-    return xr.DataArray(
-        data,
-        dims=['time', 'channel', 'wavelength', 'bin'],
-        coords={
-            'time': [0.0],
-            'channel': probe.channel_labels,
-            'wavelength': probe.wavelengths,
-            'bin': np.arange(len(bin_delays)),
-            'distance': ('channel', distances),
-            'timeDelays': ('bin', bin_delays),
-            'timeDelayWidths': ('bin', bin_widths),
-        },
-        attrs={'status': 'raw', 'lengthUnit': 'cm'},
-    )
-
-
 def _apply_td_noise(data, noise_level, rng):
     if noise_level is None:
         return data
     rng = np.random.default_rng(rng)
     data = data + rng.standard_normal(data.shape) * data * noise_level
     return np.clip(data, 0.0, None)
-
-
-def simulate_si_td_stream(probe, mua, musp, n=1.33, bin_width=25e-12, n_bins=200,
-                           noise_level=None, rng=None, freq_max=None, n_freq=None):
-    """
-    Simulate a gated TD-DOS dataset for a semi-infinite homogeneous medium.
-
-    Parameters
-    ----------
-    probe : Probe
-        Must carry a channel configuration. Distances are converted to cm
-        from ``probe.lengthUnit``; a probe without a unit is read as cm.
-    mua, musp : array-like
-        Absorption and reduced scattering in cm^-1, one per probe wavelength.
-    n : float
-        Refractive index. Default 1.33.
-    bin_width : float
-        Time-gate width in seconds. Default 25 ps.
-    n_bins : int
-        Number of gates. Default 200.
-    noise_level : float, optional
-        Proportional Gaussian noise, as a fraction of the mean. None adds
-        none.
-    rng : int or numpy.random.Generator, optional
-        Seed or generator for reproducible noise.
-    freq_max : float, optional
-        Highest modulation frequency swept in Hz, setting the time resolution
-        of the transform grid. Defaults to five times the Nyquist rate implied
-        by the requested time spacing.
-    n_freq : int, optional
-        Number of frequency points, setting both the frequency resolution and
-        the transform's time window, which must exceed the requested span or
-        the diffuse tail wraps around. Defaults to an eightfold margin.
-
-    Returns
-    -------
-    TD_Stream
-        Shape (1, n_channels, n_wavelengths, n_bins) with ``status='raw'``,
-        carrying gate delays and widths in seconds on the bin dimension.
-    """
-    from ..core.td_nirs import TD_Stream
-
-    mua = np.asarray(mua, dtype=float)
-    musp = np.asarray(musp, dtype=float)
-
-    n_wl = len(probe.wavelengths)
-    if mua.shape != (n_wl,):
-        raise ValueError(f"mua must have shape ({n_wl},) to match probe wavelengths, got {mua.shape}.")
-    if musp.shape != (n_wl,):
-        raise ValueError(f"musp must have shape ({n_wl},) to match probe wavelengths, got {musp.shape}.")
-
-    distances = probe_distances_cm(probe, untagged='cm')
-    n_ch = len(distances)
-    bin_delays, bin_widths = _default_td_gates(bin_width, n_bins)
-
-    R_eff = kernels.Reff(n, 1.0)
-    data = np.zeros((1, n_ch, n_wl, n_bins), dtype=float)
-
-    for wi in range(n_wl):
-        wl = float(probe.wavelengths[wi])
-        for ci, rho in enumerate(distances):
-            data[0, ci, wi, :] = _bin_td_fluence(
-                si_td_fluence, bin_delays, bin_widths,
-                rho=rho, mua=mua[wi], musp=musp[wi], n=n, wavelength=wl, R_eff=R_eff,
-                freq_max=freq_max, n_freq=n_freq,
-            )
-
-    data = _apply_td_noise(data, noise_level, rng)
-    data_xr = _td_data_xr(data, probe, distances, bin_delays, bin_widths)
-    return TD_Stream(data=data_xr, probe=probe, name='simulated_td', status='raw')
-
-
-def simulate_two_layer_td_stream(probe, mua, musp, n, depth, bin_width=25e-12, n_bins=200,
-                                  noise_level=None, rng=None, a=30.0, m=4000,
-                                  freq_max=None, n_freq=None):
-    """
-    Simulate a gated TD-DOS dataset for a two-layer medium.
-
-    Parameters are those of :func:`simulate_two_layer_fd_stream` for the
-    medium, and :func:`simulate_si_td_stream` for the gating and sweep.
-
-    Returns
-    -------
-    TD_Stream
-        Shape (1, n_channels, n_wavelengths, n_bins) with ``status='raw'``.
-    """
-    from ..core.td_nirs import TD_Stream
-
-    mua = np.asarray(mua, dtype=float)
-    musp = np.asarray(musp, dtype=float)
-    n = np.asarray(n, dtype=float)
-    depth = np.asarray(depth, dtype=float)
-    n_layers, n_wl = mua.shape
-
-    if musp.shape != (n_layers, n_wl):
-        raise ValueError(f"musp must have shape {(n_layers, n_wl)} to match mua, got {musp.shape}.")
-    if len(n) != n_layers:
-        raise ValueError(f"n must have shape ({n_layers},), one refractive index per layer, got {n.shape}.")
-
-    n_wl_probe = len(probe.wavelengths)
-    if n_wl != n_wl_probe:
-        raise ValueError(f"mua/musp must have shape ({n_layers}, {n_wl_probe}) to match probe wavelengths, got {mua.shape}.")
-
-    distances = probe_distances_cm(probe, untagged='cm')
-    n_ch = len(distances)
-    bin_delays, bin_widths = _default_td_gates(bin_width, n_bins)
-
-    data = np.zeros((1, n_ch, n_wl, n_bins), dtype=float)
-    for wi in range(n_wl):
-        wl = float(probe.wavelengths[wi])
-        for ci, rho in enumerate(distances):
-            data[0, ci, wi, :] = _bin_td_fluence(
-                two_layer_td_fluence, bin_delays, bin_widths,
-                rho=rho, z=0.0, mua=mua[:, wi], musp=musp[:, wi], n=n, wavelength=wl,
-                depth=depth, a=a, m=m, freq_max=freq_max, n_freq=n_freq,
-            )
-
-    data = _apply_td_noise(data, noise_level, rng)
-    data_xr = _td_data_xr(data, probe, distances, bin_delays, bin_widths)
-    return TD_Stream(data=data_xr, probe=probe, name='simulated_two_layer_td', status='raw')
-
-
-def simulate_n_layer_td_stream(probe, mua, musp, n, depth, bin_width=25e-12, n_bins=200,
-                                noise_level=None, rng=None, s_max_factor=30.0, n_points=480,
-                                freq_max=None, n_freq=None):
-    """
-    Simulate a gated TD-DOS dataset for a general N-layer medium.
-
-    Parameters are those of :func:`simulate_n_layer_fd_stream` for the medium,
-    and :func:`simulate_si_td_stream` for the gating and sweep.
-
-    Returns
-    -------
-    TD_Stream
-        Shape (1, n_channels, n_wavelengths, n_bins) with ``status='raw'``.
-    """
-    from ..core.td_nirs import TD_Stream
-
-    mua = np.asarray(mua, dtype=float)
-    musp = np.asarray(musp, dtype=float)
-    n = np.asarray(n, dtype=float)
-    depth = np.asarray(depth, dtype=float)
-    n_layers, n_wl = mua.shape
-
-    if musp.shape != (n_layers, n_wl):
-        raise ValueError(f"musp must have shape {(n_layers, n_wl)} to match mua, got {musp.shape}.")
-    if len(n) != n_layers:
-        raise ValueError(f"n must have shape ({n_layers},), one refractive index per layer, got {n.shape}.")
-
-    n_wl_probe = len(probe.wavelengths)
-    if n_wl != n_wl_probe:
-        raise ValueError(f"mua/musp must have shape ({n_layers}, {n_wl_probe}) to match probe wavelengths, got {mua.shape}.")
-
-    distances = probe_distances_cm(probe, untagged='cm')
-    n_ch = len(distances)
-    bin_delays, bin_widths = _default_td_gates(bin_width, n_bins)
-
-    data = np.zeros((1, n_ch, n_wl, n_bins), dtype=float)
-    for wi in range(n_wl):
-        wl = float(probe.wavelengths[wi])
-        for ci, rho in enumerate(distances):
-            data[0, ci, wi, :] = _bin_td_fluence(
-                n_layer_td_fluence, bin_delays, bin_widths,
-                rho=rho, z=0.0, mua=mua[:, wi], musp=musp[:, wi], n=n, wavelength=wl,
-                depth=depth, s_max_factor=s_max_factor, n_points=n_points,
-                freq_max=freq_max, n_freq=n_freq,
-            )
-
-    data = _apply_td_noise(data, noise_level, rng)
-    data_xr = _td_data_xr(data, probe, distances, bin_delays, bin_widths)
-    return TD_Stream(data=data_xr, probe=probe, name='simulated_n_layer_td', status='raw')
 
 

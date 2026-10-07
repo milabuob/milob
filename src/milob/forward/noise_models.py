@@ -43,25 +43,36 @@ def zhou_noise_model(
     np.ndarray
         Shape (n_taus,), the noisy g2 curve.
 
+    Raises
+    ------
+    ValueError
+        If the recovered field autocorrelation exceeds 1, or has no positive
+        decay rate over ``taus``.
+
     References
     ----------
     Zhou, C. et al. (2006). Optics Express, 14(3), 1125-1144.
     """
     rng = np.random.default_rng(rng)
+    taus = np.asarray(taus, dtype=float)
 
-    def find_gamma(taus, g1s):
-            def f(tau, gamma):
-                return np.exp(-gamma*tau)
-        
-            gamma = curve_fit(f, taus, g1s)
-            # print(gamma)
-            return gamma[0]
+    g2_reduced = np.asarray(clean_g2s, dtype=float) - 1.0
+    g1 = np.sqrt(np.clip(g2_reduced / beta, 0.0, None))   # clip round-off below g2 = 1
+    if g1.max() > 1.0 + 1e-3:
+        raise ValueError(
+            f"zhou_noise_model: the clean g2 implies g1 up to {g1.max():.3g} (> 1) for "
+            f"beta={beta}; a physical field autocorrelation never exceeds 1. Check beta, "
+            f"and the convergence of the forward model that produced the curve.")
 
-    g2_reduced = clean_g2s-1
-    g1 = np.sqrt(g2_reduced/beta)
-
-    ###Estimate gamma for noise model
-    gamma = find_gamma(taus, g1)    
+    # Single-exponential decay rate of g1, started from its 1/e time.
+    below = np.nonzero(g1 < np.exp(-1.0))[0]
+    gamma0 = 1.0 / (taus[below[0]] if below.size else taus[-1])
+    gamma = curve_fit(lambda tau, g: np.exp(-g * tau), taus, g1, p0=[gamma0])[0][0]
+    if not (np.isfinite(gamma) and gamma > 0):
+        raise ValueError(
+            f"zhou_noise_model: g1 does not decay over the given taus (fitted decay rate "
+            f"{gamma:.3g} 1/s), so the noise variance is undefined. Check the forward "
+            f"model's convergence, or extend taus.")
 
     # Bin widths: T[0] = first spacing, T[i] = taus[i] - taus[i-1]
     T = np.empty_like(taus)
