@@ -117,7 +117,8 @@ def si_kernel(rho, K, mua, musp, R_eff, z=0.0):
     return prefactor * (np.exp(-K * r1) / r1 - np.exp(-K * r2) / r2)
 
 
-def two_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff, a=30.0, m=4000):
+def two_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff, a=30.0, m=8000,
+                     m_tol=1e-8, m_chunk=200):
     """
     Two-layer Green's function for a finite layer over a semi-infinite one.
 
@@ -152,7 +153,14 @@ def two_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff, a=30.0, m=4000):
         Radius in cm of the disk truncating the Fourier-Bessel series, which
         must be large relative to ``rho``.
     m : int
-        Number of terms in the series.
+        Maximum number of terms in the series.
+    m_tol : float
+        Relative tolerance for stopping. Terms are added in chunks of
+        ``m_chunk`` until two consecutive chunks each change the sum by less
+        than ``m_tol``. If ``m`` terms are reached first, a warning reports
+        the last relative change and the partial sum is returned.
+    m_chunk : int
+        Number of terms added per convergence check.
 
     Returns
     -------
@@ -238,18 +246,32 @@ def two_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff, a=30.0, m=4000):
         g1 = direct_term + interface_prefactor * (reflection_numerator / reflection_denominator)
         return g1
 
-    num1 = vG_1(s_ns)
-    num2 = scipy.special.j0(s_ns * rho)
-    den = (scipy.special.j1(s_ns * aprime))**2
+    def terms(s):
+        return vG_1(s) * scipy.special.j0(s * rho) / scipy.special.j1(s * aprime) ** 2
 
-    f = np.sum((num1 * num2) / den)
-    f = f / (np.pi * (aprime**2))
+    total, small, rel = 0, 0, np.inf
+    for start in range(0, m, m_chunk):
+        s_chunk = s_ns[start:start + m_chunk]
+        n_last = len(s_chunk)
+        chunk = np.sum(terms(s_chunk))
+        total = total + chunk
+        rel = abs(chunk) / max(abs(total), 1e-300)
+        small = small + 1 if rel < m_tol else 0
+        if small >= 2:
+            break
+    else:
+        if rel >= m_tol:
+            import warnings
+            warnings.warn(
+                f"two_layer_kernel: Fourier-Bessel series did not converge to m_tol={m_tol:.0e} "
+                f"within m={m} terms at rho={float(rho):g} cm (last {n_last} terms changed the "
+                f"sum by {float(rel):.1e}, relative); returning the partial sum. Raise m.")
 
-    return f
+    return total / (np.pi * (aprime**2))
 
 
 def n_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff_top, R_eff_bottom=None,
-                    s_max_factor=30.0, n_points=480):
+                    s_max_factor=30.0, n_points=None):
     """
     General N-layer Green's function, with a finite or semi-infinite base.
 
@@ -260,6 +282,10 @@ def n_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff_top, R_eff_bottom=No
 
     A single layer covers both a semi-infinite medium and a finite slab, the
     latter through its own closed form.
+
+    The top layer's semi-infinite Green's function is added in closed form
+    through :func:`si_kernel`, and only the correction from the layers below
+    is integrated numerically.
 
     Uses mpmath at 20 decimal digits, since the hyperbolic terms overflow
     double precision for thick or absorbing layers.
@@ -289,8 +315,11 @@ def n_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff_top, R_eff_bottom=No
     s_max_factor : float
         Upper integration limit of the Hankel transform, as a multiple of the
         source layer's reduced scattering.
-    n_points : int
-        Number of quadrature points.
+    n_points : int, optional
+        Number of quadrature points. None (default) uses 480, raised at long
+        separations to keep more than one point per period of the
+        ``J0(s * rho)`` oscillation. An explicit value below one point per
+        period warns.
 
     Returns
     -------
@@ -342,6 +371,16 @@ def n_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff_top, R_eff_bottom=No
         zb_bottom = 2.0 * ell[N] * (1.0 + R_eff_bottom) / (1.0 - R_eff_bottom)
 
     s_max = s_max_factor * musp[0]
+    periods = s_max * float(rho) / (2.0 * np.pi)
+    if n_points is None:
+        n_points = max(480, int(np.ceil(1.25 * periods)))
+    elif n_points < periods:
+        import warnings
+        warnings.warn(
+            f"n_layer_kernel: n_points={n_points} under-resolves the J0(s*rho) oscillation at "
+            f"rho={float(rho):g} cm ({n_points / periods:.2f} points per period over "
+            f"s <= {s_max:g}/cm, need >= 1); the result may be far off. Use n_points >= "
+            f"{int(np.ceil(1.25 * periods))}, or the default (None).")
     x, w = np.polynomial.legendre.leggauss(n_points)
     s = 0.5 * s_max * (x + 1.0)
     ws = 0.5 * s_max * w
@@ -370,9 +409,10 @@ def n_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff_top, R_eff_bottom=No
             z_min, z_max = min(z, z0), max(z, z0)
             num = sinh(a1 * (z_min + zb_top)) * sinh(a1 * (l1 + zb_bottom - z_max))
             den = ell[1] * a1 * sinh(a1 * (l1 + zb_top + zb_bottom))
-            phi_s = num / den
+            direct_term = (exp(-a1 * abs(z - z0)) - exp(-a1 * (z + z0 + 2.0 * zb_top))) / (2.0 * ell[1] * a1)
+            correction_s = num / den - direct_term
         else:
-            phi_s = (exp(-a1 * abs(z - z0)) - exp(-a1 * (z + z0 + 2.0 * zb_top))) / (2.0 * ell[1] * a1)
+            correction_s = np.zeros_like(s)
     else:
         if N == 2:
             if finite_bottom:
@@ -428,13 +468,14 @@ def n_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff_top, R_eff_bottom=No
         A = ell[1] * a1 * beta
         B = ell[2] * a2 * ratio_sq_12 * gamma
         Nd = A * cosh(a1 * (l1 + zb_top)) + B * sinh(a1 * (l1 + zb_top))
-        direct_term = (exp(-a1 * abs(z - z0)) - exp(-a1 * (z + z0 + 2.0 * zb_top))) / (2.0 * ell[1] * a1)
         interface_prefactor = (sinh(a1 * (z0 + zb_top)) * sinh(a1 * (z + zb_top))
                                 / (ell[1] * a1 * exp(a1 * (l1 + zb_top))))
-        phi_s = direct_term + interface_prefactor * ((A - B) / Nd)
+        correction_s = interface_prefactor * ((A - B) / Nd)
 
-    phi_s = np.array([complex(v) for v in phi_s])
-    integrand = phi_s * s * scipy.special.j0(s * rho)
-    return complex(np.sum(ws * integrand) / (2.0 * np.pi))
+    # The direct term's inverse Hankel transform is si_kernel (Sommerfeld identity).
+    semi_infinite = si_kernel(rho, np.sqrt(K_sq[0]), mua[0], musp[0], R_eff_top, z)
+    correction_s = np.array([complex(v) for v in correction_s])
+    integrand = correction_s * s * scipy.special.j0(s * rho)
+    return complex(semi_infinite + np.sum(ws * integrand) / (2.0 * np.pi))
 
 

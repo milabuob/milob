@@ -38,8 +38,9 @@ measurement types at once — an FD-DOS and a DCS recording fitted together, for
 **Forward models.** Semi-infinite, two-layer and general N-layer diffusion kernels, each
 available as FD/CW fluence, time-domain fluence, and DCS field autocorrelation. Scatterer
 dynamics as Brownian, random-flow or Langevin motion. Spectral parameterisation lets you
-fit chromophore concentrations directly rather than per-wavelength absorption. Every
-geometry also ships a simulator that returns a ready-to-analyse stream.
+fit chromophore concentrations directly rather than per-wavelength absorption. One
+simulator per modality (`simulate_fd_stream`, `simulate_td_stream`, `simulate_dcs_stream`)
+takes the geometry as an argument and returns a ready-to-analyse stream.
 
 **Statistics.** A GLM with canonical HRF regressors, short-separation and PCA nuisance
 regression, and three fitting methods (OLS, robust, AR-IRLS with pre-whitening). Group
@@ -93,8 +94,8 @@ Requires Python 3.10.4 or newer.
 
 ### Simulate and fit
 
-Every forward model has a matching simulator, so you can exercise the whole pipeline
-without any data on disk:
+Every forward model can be simulated, so you can exercise the whole pipeline without
+any data on disk:
 
 ```python
 import numpy as np
@@ -128,6 +129,10 @@ tissue = op.to_concentration()      # -> TissueStream  (HbO, HbR, ...)
 print(op.select('mua').values.ravel()[:2])     # ~[0.094, 0.109]  (true 0.10, 0.12)
 print(float(tissue.sto2().values.ravel()[0]))  # ~0.64
 ```
+
+A layered medium is the same call with per-layer values and the geometry named:
+`mua=[[0.10, 0.12], [0.15, 0.18]], musp=[[11.0, 9.0], [10.0, 8.0]], geometry="two_layer",
+depth=[1.0]` (a 1 cm top layer over a semi-infinite one).
 
 The same shape of call fits DCS:
 
