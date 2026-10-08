@@ -110,9 +110,11 @@ def calculate_moments(datastream, sheppards_corr=True):
 
     if sheppards_corr:
         if 'timeDelayWidths' in data_xr.coords:
+            if data_xr.coords["timeDelayWidths"][0] != data_xr.coords["timeDelayWidths"][-1]:
+                print("Warning: timeDelayWidths are not uniform across bins. Using first bin width for Sheppard's correction.")
             t_bin_width = data_xr.coords["timeDelayWidths"][0]
         else:
-            raise ValueError("timeDelayWidths now found. Need for Sheppard's correction application.")
+            raise ValueError("timeDelayWidths not found. Need for Sheppard's correction application.")
 
         m2 = m2 - (t_bin_width)**2 / 12
     
