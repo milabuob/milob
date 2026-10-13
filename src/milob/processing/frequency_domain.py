@@ -109,7 +109,7 @@ def fd_slopefitting(data: Union[np.ndarray, xr.DataArray],
             img_reg,  img_cov  = np.polyfit(distances, phase_t,   1, cov=True)
 
             k_r =  real_reg[0]
-            k_i = -img_reg[0]   # phase decreases with distance → flip sign
+            k_i = -img_reg[0]   
 
             # Optical properties
             mua  = (omega / (2 * v)) * (k_r / k_i - k_i / k_r)

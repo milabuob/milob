@@ -64,13 +64,15 @@ class FD_Stream(NirsStream):
         Parameters
         ----------
         filepath : str
-            Path to the text file.
-        detector : int, optional
-            Detector to read.
+            Path to the OxiplexTS .txt file.
+        detector : {'A', 'B'}
+            Which detector array to read.
         wavelength_mask : array-like, optional
-            Wavelengths to keep.
+            Wavelength in nm for each raw channel column.
         sc_threshold : float or None
-            Source-detector distance in mm below which a channel is short.
+            Source-detector distance in mm below which a channel is classified as
+            short. Pass None if the probe design has no short-separation
+            channels.
 
         Returns
         -------
@@ -94,7 +96,9 @@ class FD_Stream(NirsStream):
             Instrument RF modulation frequency in Hz. Not stored in the file, so
             it must be supplied.
         sc_threshold : float or None
-            Source-detector distance in mm below which a channel is short.
+            Source-detector distance in mm below which a channel is classified as
+            short. Pass None if the probe design has no short-separation
+            channels.
         apply_calibration : bool
             Apply the file's own AC/DC/phase calibration values. Default False,
             as they are normally already applied to the stored data.
@@ -180,7 +184,7 @@ class FD_Stream(NirsStream):
     # Modality conversion
     # ------------------------------------------------------------------
 
-    def to_cw(self, inplace: bool = False) -> 'CW_Stream':
+    def to_cw(self) -> 'CW_Stream':
         """
         Collapse to the DC component, giving CW-equivalent data.
 
@@ -188,12 +192,6 @@ class FD_Stream(NirsStream):
         modality conversion rather than an approximation. The AC measurement is
         discarded, and with it the phase information that separates absorption
         from scattering at a single distance.
-
-        Parameters
-        ----------
-        inplace : bool
-            Ignored; a new object is always returned, since the freq dimension is
-            consumed and the dtype becomes real.
 
         Returns
         -------
@@ -229,7 +227,7 @@ class FD_Stream(NirsStream):
                        distances: Optional[np.ndarray] = None,
                        n: float = 1.33,
                        freq: float = None,
-                       inplace: bool = False) -> 'OptPropStream':
+                       ) -> 'OptPropStream':
         """
         Derive optical properties by multi-distance slope fitting.
 
@@ -243,14 +241,10 @@ class FD_Stream(NirsStream):
             Source-detector distances in cm. Read from ``data.coords['distance']``
             if omitted.
         n : float
-            Tissue refractive index. Default 1.33. Semi-infinite geometry only;
-            a two-layer model takes ``n_1`` and ``n_2`` through
-            ``forward_parameters``.
+            Tissue refractive index. Default 1.33. 
         freq : float, optional
             Modulation frequency in Hz. Selected automatically if only one is
             present.
-        inplace : bool
-            Ignored; a new OptPropStream is always returned.
 
         Returns
         -------
@@ -413,8 +407,6 @@ class FD_Stream(NirsStream):
         # case), or -- since that would otherwise leave n_jobs with nothing
         # to parallelise -- into fd_model_opt's own multi-start loop when
         # there's only a single slice (e.g. one time point, one wavelength).
-        # Never both at once: nesting two independent n_jobs=-1 dispatches
-        # would try to oversubscribe to (cores)^2 worker processes.
         single_slice = len(slices) == 1
         outer_n_jobs = 1 if single_slice else n_jobs
         inner_n_jobs = n_jobs if single_slice else 1
