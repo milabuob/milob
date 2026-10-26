@@ -186,8 +186,8 @@ def read_oxiplex(filepath: str,
     # -----------------------------------------------------------------------
     times = data_block[:, 1]
 
-    # One event per row where the 'Marker' column is nonzero (see the Notes
-    # above). Shared by both detectors, so this doesn't depend on `detector`.
+    # One event per row where the 'Marker' column is nonzero. 
+    # Shared by both detectors, so this doesn't depend on `detector`.
     events = Events()
     for t, m in zip(times, data_block[:, marker_col]):
         if m != 0:

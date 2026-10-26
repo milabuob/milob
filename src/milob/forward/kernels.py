@@ -210,10 +210,7 @@ def two_layer_kernel(rho, z, K_sq, mua, musp, n, depth, R_eff, a=30.0, m=8000,
 
     mut_1 = mua_1 + musp_1
     mut_2 = mua_2 + musp_2
-    # 1/(3*mut) -- a length, NOT the true (v-carrying) diffusion coefficient;
-    # kept as a separate name from D to avoid that confusion (the legacy
-    # code called this "D_1"/"D_2"). K1_sq/K2_sq already carry the v-scaled
-    # physics via dispersion.k2().
+
     ell_1 = 1.0 / (3.0 * mut_1)
     ell_2 = 1.0 / (3.0 * mut_2)
     zb_1 = 2.0 * ell_1 * (1.0 + R_eff_1) / (1.0 - R_eff_1)

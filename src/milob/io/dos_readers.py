@@ -179,9 +179,8 @@ def read_ISS_BOXY(datafile: str, layout_file: str, *, modulation_frequency: floa
         Stream name. Defaults to 'fd-nirs'.
     apply_calibration : bool
         Apply the file's own calibration terms and factors to the raw columns.
-        Default False, since the stored values normally already include them
-        and re-applying double-calibrates. Phase is converted from degrees to
-        radians either way.
+        Default False, since the stored values normally already include them.
+        Phase is converted from degrees to radians either way.
 
     Returns
     -------
@@ -271,7 +270,7 @@ def read_ISS_BOXY(datafile: str, layout_file: str, *, modulation_frequency: floa
             dc_raw[:, i] = dc_raw[:, i] * dc_factor
             ph_raw[:, i] = ph_raw[:, i] + ph_term
 
-    # --- Split the 8 mapped channels by wavelength (mirrors io.oxiplex) ---
+    # --- Split the mapped channels by wavelength (mirrors io.oxiplex) ---
     wavelengths = np.unique(lam[wl_idx - 1])
     unique_sources = np.unique(src_ids)
     n_wl = wavelengths.shape[0]
@@ -313,8 +312,7 @@ def read_ISS_BOXY(datafile: str, layout_file: str, *, modulation_frequency: floa
     time_col = data[:, col_idx['time']]
     times = time_col - time_col[0]
 
-    # One event per row where the instrument's 'mark' column is nonzero
-    # (see the Notes above).
+    # One event per row where the instrument's 'mark' column is nonzero.
     events = Events()
     if 'mark' in col_idx:
         for t, m in zip(times, data[:, col_idx['mark']]):

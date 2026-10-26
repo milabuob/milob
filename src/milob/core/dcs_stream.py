@@ -120,13 +120,12 @@ class DCS_Stream(NirsStream):
         n_jobs: int = 1,
         sigma: Optional[float] = None,
         absolute_sigma: bool = False,
-        inplace: bool = False,
     ) -> "OptPropStream":
         """
         Fit a DCS forward model to the correlation curves.
 
         Every (time, channel, wavelength) slice is fitted independently unless
-        ``channel_grouping`` combines channels into a shared fit. DCS cannot
+        ``channel_grouping`` combines channels into a shared fit. CW-DCS cannot
         identify ``mua`` and ``musp`` from its own data, so supply them through
         ``forward_parameters``, typically from a co-registered FD-DOS measurement.
 
@@ -443,7 +442,7 @@ class DCS_Stream(NirsStream):
 
     def aggregate_channels(self, groups: Optional[dict] = None, *,
                             positions: Optional[dict] = None,
-                            position_tol: float = 5.0,
+                            position_tol: float = 3.0,
                             method: str = 'mean',
                             inplace: bool = False):
         """
